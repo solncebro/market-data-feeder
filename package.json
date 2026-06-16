@@ -1,0 +1,35 @@
+{
+  "name": "@solncebro/market-data-feeder",
+  "version": "0.1.0",
+  "description": "On-demand market-data feeder: one exchange connection, fans klines/MA/24h-volume out to multiple strategy apps over a local WebSocket channel",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "yarn lint && yarn test && rm -rf dist && tsc",
+    "start": "node dist/feeder.js",
+    "dev": "tsx src/feeder.ts",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "deploy:binance": "yarn build && ssh root@82.26.198.214 'mkdir -p /opt/market-data-feeder-binance/' && rsync --archive --compress --delete .env.binance dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-binance/ && ssh root@82.26.198.214 'cd /opt/market-data-feeder-binance && mv .env.binance .env'",
+    "deploy": "yarn build && ssh root@82.26.198.214 'mkdir -p /opt/market-data-feeder-bybit/' && rsync --archive --compress --delete .env.bybit dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-bybit/ && ssh root@82.26.198.214 'cd /opt/market-data-feeder-bybit && mv .env.bybit .env'",
+    "deploy:all": "yarn build && ssh root@82.26.198.214 'mkdir -p /opt/market-data-feeder-binance /opt/market-data-feeder-bybit' && rsync --archive --compress --delete .env.binance dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-binance/ && rsync --archive --compress --delete .env.bybit dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-bybit/ && ssh root@82.26.198.214 'cd /opt/market-data-feeder-binance && mv .env.binance .env && cd /opt/market-data-feeder-bybit && mv .env.bybit .env'"
+  },
+  "dependencies": {
+    "@solncebro/trade-engine": "file:../trade-engine",
+    "@solncebro/websocket-engine": "file:../websocket-engine",
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

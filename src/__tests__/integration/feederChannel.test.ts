@@ -1,0 +1,258 @@
+import { EventEmitter } from 'node:events';
+
+import { describe, expect, it } from 'vitest';
+import type { WebSocketLogger } from '@solncebro/websocket-engine';
+
+import type { Kline, KlineInterval, MaValues } from '../../domain/marketData.types.js';
+import type { FeederSource } from '../../server/feederSource.types.js';
+import type { FeederLogger } from '../../server/feederServer.types.js';
+import { FeederServer } from '../../server/feederServer.js';
+import { MarketDataClient } from '../../client/marketDataClient.js';
+
+const NOOP_FEEDER_LOGGER: FeederLogger = {
+  info: () => undefined,
+  warn: () => undefined,
+  error: () => undefined,
+};
+
+const NOOP_WS_LOGGER: WebSocketLogger = {
+  debug: () => undefined,
+  info: () => undefined,
+  warn: () => undefined,
+  error: () => undefined,
+  fatal: () => undefined,
+};
+
+function makeKline(openTimestamp: number): Kline {
+  return {
+    openTimestamp,
+    openPrice: 100,
+    highPrice: 110,
+    lowPrice: 90,
+    closePrice: 105,
+    volume: 1000,
+    closeTimestamp: openTimestamp + 1_799_999,
+    quoteAssetVolume: 105_000,
+    numberOfTrades: 50,
+    takerBuyBaseAssetVolume: 500,
+    takerBuyQuoteAssetVolume: 52_500,
+    isClosed: true,
+  };
+}
+
+function makeMa(seed: number): MaValues {
+  return { ma25: seed, ma50: seed + 1, ma100: seed + 2, ma200: seed + 3 };
+}
+
+class FakeFeederSource extends EventEmitter implements FeederSource {
+  private readonly interval: KlineInterval;
+  private readonly klineListBySymbol: Map<string, Kline[]>;
+
+  constructor(interval: KlineInterval, klineListBySymbol: Map<string, Kline[]>) {
+    super();
+    this.interval = interval;
+    this.klineListBySymbol = klineListBySymbol;
+  }
+
+  start(): void {
+    return undefined;
+  }
+
+  async loadAllSymbols(): Promise<void> {
+    return undefined;
+  }
+
+  async ensureSymbolLoaded(): Promise<boolean> {
+    return true;
+  }
+
+  releaseSymbol(): void {
+    return undefined;
+  }
+
+  async syncAllSymbols(): Promise<void> {
+    return undefined;
+  }
+
+  async shutdown(): Promise<void> {
+    return undefined;
+  }
+
+  setSymbolKlines(symbol: string, klineList: Kline[]): void {
+    this.klineListBySymbol.set(symbol, klineList);
+  }
+
+  getInterval(): KlineInterval {
+    return this.interval;
+  }
+
+  getSymbolList(): string[] {
+    return Array.from(this.klineListBySymbol.keys());
+  }
+
+  getKlineList(symbol: string): Kline[] {
+    return this.klineListBySymbol.get(symbol) ?? [];
+  }
+
+  getMaValues(): MaValues {
+    return makeMa(10);
+  }
+
+  getCurrentKline(): Kline | undefined {
+    return undefined;
+  }
+
+  getVolume24h(): number {
+    return 5_000_000;
+  }
+}
+
+function buildClient(port: number, events: ('klineClosed' | 'klineUpdated' | 'klineUpdatedTick')[]): MarketDataClient {
+  return new MarketDataClient({
+    url: `ws://127.0.0.1:${port}`,
+    interval: '30m',
+    scope: { kind: 'all' },
+    events,
+    wantMa: true,
+    logger: NOOP_WS_LOGGER,
+  });
+}
+
+describe('feeder channel', () => {
+  it('does not create a source until a client subscribes, then reuses one source for two clients', async () => {
+    const source = new FakeFeederSource('30m', new Map([['BTCUSDT', [makeKline(1000)]]]));
+    let createCount = 0;
+    const server = new FeederServer({
+      port: 0,
+      logger: NOOP_FEEDER_LOGGER,
+      createSource: () => {
+        createCount += 1;
+
+        return source;
+      },
+    });
+    await server.start();
+    expect(createCount).toBe(0);
+
+    const clientA = buildClient(server.getPort(), ['klineClosed']);
+    const clientB = buildClient(server.getPort(), ['klineClosed']);
+
+    try {
+      await clientA.waitUntilReady(3000);
+      await clientB.waitUntilReady(3000);
+
+      expect(createCount).toBe(1);
+    } finally {
+      clientA.close();
+      clientB.close();
+      await server.shutdown();
+    }
+  });
+
+  it('delivers a snapshot and forwards a live klineClosed into the client mirror', async () => {
+    const source = new FakeFeederSource('30m', new Map([['BTCUSDT', [makeKline(1000), makeKline(2000)]]]));
+    const server = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => source });
+    await server.start();
+
+    const client = buildClient(server.getPort(), ['klineClosed', 'klineUpdated', 'klineUpdatedTick']);
+
+    try {
+      await client.waitUntilReady(3000);
+
+      expect(client.isStale()).toBe(false);
+      expect(client.getSymbolList()).toEqual(['BTCUSDT']);
+      expect(client.getKlineList('BTCUSDT').map((kline) => kline.openTimestamp)).toEqual([1000, 2000]);
+      expect(client.getVolume24h('BTCUSDT')).toBe(5_000_000);
+      expect(client.getMaValues('BTCUSDT')).toEqual(makeMa(10));
+
+      const eventPromise = new Promise<{ symbol: string; openTimestamp: number }>((resolve) => {
+        client.once('klineClosed', (symbol: string, kline: Kline) => {
+          resolve({ symbol, openTimestamp: kline.openTimestamp });
+        });
+      });
+
+      source.emit('klineClosed', 'BTCUSDT', makeKline(3000), makeMa(30));
+
+      const event = await eventPromise;
+
+      expect(event).toEqual({ symbol: 'BTCUSDT', openTimestamp: 3000 });
+      expect(client.getKlineList('BTCUSDT').map((kline) => kline.openTimestamp)).toEqual([1000, 2000, 3000]);
+      expect(client.getMaValues('BTCUSDT')).toEqual(makeMa(30));
+    } finally {
+      client.close();
+      await server.shutdown();
+    }
+  });
+
+  it('propagates symbolAdded and symbolRemoved into the client mirror and listeners', async () => {
+    const source = new FakeFeederSource('30m', new Map([['BTCUSDT', [makeKline(1000)]]]));
+    const server = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => source });
+    await server.start();
+
+    const client = buildClient(server.getPort(), ['klineClosed']);
+
+    try {
+      await client.waitUntilReady(3000);
+      expect(client.getSymbolList()).toEqual(['BTCUSDT']);
+
+      source.setSymbolKlines('ETHUSDT', [makeKline(1000), makeKline(2000)]);
+      const addedPromise = new Promise<string>((resolve) => {
+        client.once('symbolAdded', (symbol: string) => {
+          resolve(symbol);
+        });
+      });
+      source.emit('symbolAdded', 'ETHUSDT');
+
+      expect(await addedPromise).toBe('ETHUSDT');
+      expect(client.getSymbolList().slice().sort()).toEqual(['BTCUSDT', 'ETHUSDT']);
+      expect(client.getKlineList('ETHUSDT').map((kline) => kline.openTimestamp)).toEqual([1000, 2000]);
+
+      const removedPromise = new Promise<string>((resolve) => {
+        client.once('symbolRemoved', (symbol: string) => {
+          resolve(symbol);
+        });
+      });
+      source.emit('symbolRemoved', 'BTCUSDT');
+
+      expect(await removedPromise).toBe('BTCUSDT');
+      expect(client.getSymbolList()).toEqual(['ETHUSDT']);
+      expect(client.getKlineList('BTCUSDT')).toEqual([]);
+    } finally {
+      client.close();
+      await server.shutdown();
+    }
+  });
+
+  it('does not forward events a client did not subscribe to', async () => {
+    const source = new FakeFeederSource('30m', new Map([['BTCUSDT', [makeKline(1000)]]]));
+    const server = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => source });
+    await server.start();
+
+    const client = buildClient(server.getPort(), ['klineClosed']);
+
+    try {
+      await client.waitUntilReady(3000);
+
+      let updatedCount = 0;
+      client.on('klineUpdated', () => {
+        updatedCount += 1;
+      });
+
+      const closedPromise = new Promise<void>((resolve) => {
+        client.once('klineClosed', () => {
+          resolve();
+        });
+      });
+
+      source.emit('klineUpdated', 'BTCUSDT', makeKline(2000), makeMa(20));
+      source.emit('klineClosed', 'BTCUSDT', makeKline(2000), makeMa(20));
+
+      await closedPromise;
+
+      expect(updatedCount).toBe(0);
+    } finally {
+      client.close();
+      await server.shutdown();
+    }
+  });
+});

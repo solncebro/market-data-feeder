@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+!.env.binance.example
+!.env.bybit.example
+firebase-sa.json
+*.log
+.DS_Store
