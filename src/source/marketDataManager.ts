@@ -1,26 +1,50 @@
 import { EventEmitter } from 'node:events';
 
-import { MarketTypeEnum, logger } from '@solncebro/trade-engine';
+import { MarketTypeEnum, RateLimitedRequestQueue, logger } from '@solncebro/trade-engine';
 import type { ExchangeConnector, Kline, SubscribeKlinesArgs } from '@solncebro/trade-engine';
 
 import type { KlineInterval, MaValues, StaleSymbolInfo } from '../domain/marketData.types.js';
 import { KLINE_BUFFER_SIZE, STALENESS_THRESHOLD_MULTIPLIER, resolveIntervalMs } from '../domain/constants.js';
 import { calculateAllMaValues } from './indicators.js';
+import { crossesMassStaleThreshold } from './massStale.js';
 import { computeSymbolListDelta } from './symbolListDelta.js';
 import { withTimeout } from '../utils/timeout.js';
 import { startIntervalScheduler } from '../utils/intervalScheduler.js';
 import type { IntervalSchedulerHandle } from '../utils/intervalScheduler.js';
-import type { FeederSource } from '../server/feederSource.types.js';
+import type { FeederSource, StreamLiveness } from '../server/feederSource.types.js';
 
-const FETCH_BATCH_SIZE = 200;
-const FETCH_BATCH_DELAY_MS = 300;
 const KLINE_UPDATE_THROTTLE_MS = 5000;
 const STALENESS_CHECK_INTERVAL_MS = 60_000;
 const STALENESS_HEARTBEAT_EVERY_N_TICKS = 15;
 const LOAD_KLINES_TIMEOUT_MS = 60_000;
 const PERSISTENT_STALE_THRESHOLD_TICK_COUNT = 10;
+const KLINE_LOAD_PROGRESS_LOG_EVERY = 100;
+
+const SILENCE_CHECK_INTERVAL_MS = 10_000;
+const SILENCE_THRESHOLD_MS = 45_000;
+
+const VOLUME_REFRESH_INTERVAL_MS = 30_000;
+
+const MASS_STALE_RATIO_THRESHOLD = 0.3;
+const MASS_STALE_MIN_SYMBOLS = 20;
+
+const KLINE_BACKFILL_REQUESTS_PER_SECOND = 80;
+
+const DEFAULT_BACKFILL_QUEUE = new RateLimitedRequestQueue({
+  rateLimit: KLINE_BACKFILL_REQUESTS_PER_SECOND,
+  intervalMs: 1000,
+  loggerLabel: '[MarketData:backfill]',
+});
 
 const ZERO_MA: MaValues = { ma25: 0, ma50: 0, ma100: 0, ma200: 0 };
+
+export function markBackfilledHistoryClosed(klineList: Kline[]): void {
+  for (let index = 0; index < klineList.length - 1; index++) {
+    if (klineList[index].isClosed !== true) {
+      klineList[index].isClosed = true;
+    }
+  }
+}
 
 class MarketDataManager extends EventEmitter implements FeederSource {
   private readonly exchangeConnector: ExchangeConnector;
@@ -32,23 +56,29 @@ class MarketDataManager extends EventEmitter implements FeederSource {
   private readonly currentKlineBySymbol: Map<string, Kline> = new Map();
   private readonly lastEmittedUpdateBySymbol: Map<string, { openTimestamp: number; emittedAtMs: number }> = new Map();
   private readonly consecutiveStaleScanCountBySymbol: Map<string, number> = new Map();
+  private readonly persistentStaleEmittedSet: Set<string> = new Set();
   private readonly skippedOlderKlineCountBySymbol: Map<string, number> = new Map();
   private throttledMaRecomputeCount: number = 0;
-  private onPersistentStaleSymbol: ((symbol: string) => void) | null = null;
+  private lastInboundAtMs: number = 0;
+  private isStreamSilent: boolean = false;
+  private isMassStale: boolean = false;
   private stalenessSchedulerHandle: IntervalSchedulerHandle | null = null;
+  private silenceSchedulerHandle: IntervalSchedulerHandle | null = null;
+  private volumeSchedulerHandle: IntervalSchedulerHandle | null = null;
+  private readonly lastEmittedVolumeBySymbol: Map<string, number> = new Map();
+  private readonly backfillQueue: RateLimitedRequestQueue;
 
-  constructor(exchangeConnector: ExchangeConnector, interval: KlineInterval) {
+  constructor(exchangeConnector: ExchangeConnector, interval: KlineInterval, backfillQueue: RateLimitedRequestQueue = DEFAULT_BACKFILL_QUEUE) {
     super();
     this.exchangeConnector = exchangeConnector;
     this.interval = interval;
-  }
-
-  setPersistentStaleSymbolCallback(callback: (symbol: string) => void): void {
-    this.onPersistentStaleSymbol = callback;
+    this.backfillQueue = backfillQueue;
   }
 
   start(): void {
     this.startStalenessWatchdog();
+    this.startSilenceWatchdog();
+    this.startVolumeRefreshScheduler();
   }
 
   async loadAllSymbols(): Promise<void> {
@@ -57,10 +87,13 @@ class MarketDataManager extends EventEmitter implements FeederSource {
 
     logger.info({ symbolCount: usdtSymbolList.length, filtered: allSymbolList.length - usdtSymbolList.length }, `[MarketData] Starting kline loading: ${usdtSymbolList.length} USDT symbols [${this.interval}]`);
 
-    await this.loadKlinesInBatches(usdtSymbolList);
+    this.emit('intervalLoadStarted', usdtSymbolList.length);
+
+    await this.loadKlines(usdtSymbolList);
     this.subscribeToKlines(usdtSymbolList);
 
     logger.info({ totalSymbols: usdtSymbolList.length }, `[MarketData] All klines loaded (${usdtSymbolList.length} symbols), subscriptions active [${this.interval}]`);
+    this.emit('intervalLoadCompleted', usdtSymbolList.length);
   }
 
   getInterval(): KlineInterval {
@@ -87,6 +120,16 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     return Array.from(this.klineListBySymbol.keys());
   }
 
+  getKlineCount(): number {
+    let total = 0;
+
+    for (const klineList of this.klineListBySymbol.values()) {
+      total += klineList.length;
+    }
+
+    return total;
+  }
+
   getLastUpdateTimestamp(symbol: string): number | undefined {
     return this.lastEmittedUpdateBySymbol.get(symbol)?.emittedAtMs;
   }
@@ -109,6 +152,20 @@ class MarketDataManager extends EventEmitter implements FeederSource {
 
   getSubscriptionCount(): number {
     return this.subscriptionBySymbol.size;
+  }
+
+  getStreamLiveness(): StreamLiveness {
+    const silenceMs = this.lastInboundAtMs > 0 ? Date.now() - this.lastInboundAtMs : 0;
+
+    return { lastInboundAtMs: this.lastInboundAtMs, silenceMs, isStreamSilent: this.isStreamSilent };
+  }
+
+  getFreshSymbolCount(): number {
+    return this.klineListBySymbol.size - this.getStaleSymbolList().length;
+  }
+
+  getPersistentStaleCount(): number {
+    return this.consecutiveStaleScanCountBySymbol.size;
   }
 
   getStaleSymbolList(): StaleSymbolInfo[] {
@@ -146,7 +203,10 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     logger.info({ symbol }, `[MarketData] ${symbol} ensureSymbolLoaded fetchKlines request limit=${KLINE_BUFFER_SIZE} [${this.interval}]`);
 
     try {
-      const rawKlineList = await this.fetchKlinesWithTimeout(exchangeClient.fetchKlines(symbol, this.interval, { limit: KLINE_BUFFER_SIZE }), LOAD_KLINES_TIMEOUT_MS, symbol);
+      const rawKlineList = await this.backfillQueue.execute(
+        () => this.fetchKlinesWithTimeout(exchangeClient.fetchKlines(symbol, this.interval, { limit: KLINE_BUFFER_SIZE }), LOAD_KLINES_TIMEOUT_MS, symbol),
+        `ensureSymbolLoaded ${symbol} [${this.interval}]`,
+      );
       const klineList = rawKlineList.slice(-KLINE_BUFFER_SIZE);
 
       logger.info({ symbol, klineCount: klineList.length }, `[MarketData] ${symbol} ensureSymbolLoaded fetchKlines response klineCount=${klineList.length} [${this.interval}]`);
@@ -157,6 +217,7 @@ class MarketDataManager extends EventEmitter implements FeederSource {
         return false;
       }
 
+      markBackfilledHistoryClosed(klineList);
       this.klineListBySymbol.set(symbol, klineList);
 
       const lastKline = klineList[klineList.length - 1];
@@ -168,6 +229,7 @@ class MarketDataManager extends EventEmitter implements FeederSource {
       this.recalculateAndStoreMa(symbol, klineList);
       this.subscribeToKlines([symbol]);
       logger.info({ symbol }, `[MarketData] ${symbol} ensureSymbolLoaded — subscribed [${this.interval}]`);
+      this.emit('symbolLoadCompleted', symbol);
 
       return true;
     } catch (error: unknown) {
@@ -196,7 +258,9 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     this.currentKlineBySymbol.delete(symbol);
     this.lastEmittedUpdateBySymbol.delete(symbol);
     this.consecutiveStaleScanCountBySymbol.delete(symbol);
+    this.persistentStaleEmittedSet.delete(symbol);
     this.skippedOlderKlineCountBySymbol.delete(symbol);
+    this.lastEmittedVolumeBySymbol.delete(symbol);
   }
 
   async syncAllSymbols(): Promise<void> {
@@ -236,6 +300,16 @@ class MarketDataManager extends EventEmitter implements FeederSource {
       this.stalenessSchedulerHandle = null;
     }
 
+    if (this.silenceSchedulerHandle !== null) {
+      this.silenceSchedulerHandle.stop();
+      this.silenceSchedulerHandle = null;
+    }
+
+    if (this.volumeSchedulerHandle !== null) {
+      this.volumeSchedulerHandle.stop();
+      this.volumeSchedulerHandle = null;
+    }
+
     for (const subscription of this.subscriptionBySymbol.values()) {
       exchangeClient.unsubscribeKlines(subscription);
     }
@@ -248,50 +322,49 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     return withTimeout(fetchPromise, timeoutMs, `fetchKlines timeout after ${timeoutMs}ms for symbol ${symbol} [${this.interval}]`);
   }
 
-  private async loadKlinesInBatches(symbolList: string[]): Promise<void> {
+  private async loadKlines(symbolList: string[]): Promise<void> {
     const exchangeClient = this.exchangeConnector.futures;
     let loadedCount = 0;
 
-    for (let i = 0; i < symbolList.length; i += FETCH_BATCH_SIZE) {
-      const symbolBatchList = symbolList.slice(i, i + FETCH_BATCH_SIZE);
+    const fetchResultList = await Promise.all(
+      symbolList.map(async (symbol) => {
+        try {
+          const rawKlineList = await this.backfillQueue.execute(
+            () => this.fetchKlinesWithTimeout(exchangeClient.fetchKlines(symbol, this.interval, { limit: KLINE_BUFFER_SIZE }), LOAD_KLINES_TIMEOUT_MS, symbol),
+            `fetchKlines ${symbol} [${this.interval}]`,
+          );
+          const klineList = rawKlineList.slice(-KLINE_BUFFER_SIZE);
 
-      const fetchResultList = await Promise.all(
-        symbolBatchList.map(async (symbol) => {
-          try {
-            const rawKlineList = await this.fetchKlinesWithTimeout(exchangeClient.fetchKlines(symbol, this.interval, { limit: KLINE_BUFFER_SIZE }), LOAD_KLINES_TIMEOUT_MS, symbol);
-            const klineList = rawKlineList.slice(-KLINE_BUFFER_SIZE);
+          return { symbol, klineList };
+        } catch (error: unknown) {
+          logger.warn({ symbol, error }, `[MarketData] ${symbol} Failed to load klines, skipping [${this.interval}]`);
 
-            return { symbol, klineList };
-          } catch (error: unknown) {
-            logger.warn({ symbol, error }, `[MarketData] ${symbol} Failed to load klines, skipping [${this.interval}]`);
+          return { symbol, klineList: [] as Kline[] };
+        } finally {
+          loadedCount++;
 
-            return { symbol, klineList: [] as Kline[] };
+          if (loadedCount % KLINE_LOAD_PROGRESS_LOG_EVERY === 0 || loadedCount === symbolList.length) {
+            logger.info({ loaded: loadedCount, total: symbolList.length }, `[MarketData] Kline loading progress ${loadedCount}/${symbolList.length} [${this.interval}]`);
           }
-        }),
-      );
-
-      for (const { symbol, klineList } of fetchResultList) {
-        if (klineList.length === 0) {
-          continue;
         }
+      }),
+    );
 
-        this.klineListBySymbol.set(symbol, klineList);
-
-        const lastKline = klineList[klineList.length - 1];
-
-        if (lastKline.isClosed !== true) {
-          this.currentKlineBySymbol.set(symbol, lastKline);
-        }
-
-        this.recalculateAndStoreMa(symbol, klineList);
+    for (const { symbol, klineList } of fetchResultList) {
+      if (klineList.length === 0) {
+        continue;
       }
 
-      loadedCount += symbolBatchList.length;
-      logger.info({ loaded: loadedCount, total: symbolList.length }, `[MarketData] Kline loading progress ${loadedCount}/${symbolList.length} [${this.interval}]`);
+      markBackfilledHistoryClosed(klineList);
+      this.klineListBySymbol.set(symbol, klineList);
 
-      if (i + FETCH_BATCH_SIZE < symbolList.length) {
-        await new Promise((resolve) => setTimeout(resolve, FETCH_BATCH_DELAY_MS));
+      const lastKline = klineList[klineList.length - 1];
+
+      if (lastKline.isClosed !== true) {
+        this.currentKlineBySymbol.set(symbol, lastKline);
       }
+
+      this.recalculateAndStoreMa(symbol, klineList);
     }
   }
 
@@ -316,15 +389,34 @@ class MarketDataManager extends EventEmitter implements FeederSource {
       const subscription: SubscribeKlinesArgs = { symbol, interval: this.interval, handler };
       this.subscriptionBySymbol.set(symbol, subscription);
       exchangeClient.subscribeKlines(subscription);
+
+      if (this.lastInboundAtMs === 0) {
+        this.lastInboundAtMs = Date.now();
+      }
     }
   }
 
   private handleKline(symbol: string, kline: Kline): void {
+    this.recordInboundMessage();
+
     try {
       this.handleKlineUnsafe(symbol, kline);
     } catch (error: unknown) {
       logger.error({ error, symbol, kline }, `[MarketData] ${symbol} handleKline threw unexpected error — swallowing to keep SDK callback loop alive [${this.interval}]`);
     }
+  }
+
+  private recordInboundMessage(): void {
+    const nowMs = Date.now();
+
+    if (this.isStreamSilent) {
+      const silenceMs = this.lastInboundAtMs > 0 ? nowMs - this.lastInboundAtMs : 0;
+      this.isStreamSilent = false;
+      logger.info({ silenceMs }, `[MarketData] Stream resumed after ${Math.round(silenceMs / 1000)}s of silence [${this.interval}]`);
+      this.emit('streamResumed', silenceMs);
+    }
+
+    this.lastInboundAtMs = nowMs;
   }
 
   private handleKlineUnsafe(symbol: string, kline: Kline): void {
@@ -346,6 +438,10 @@ class MarketDataManager extends EventEmitter implements FeederSource {
 
     if (this.consecutiveStaleScanCountBySymbol.has(symbol) && this.isKlineFresh(kline)) {
       this.consecutiveStaleScanCountBySymbol.delete(symbol);
+
+      if (this.persistentStaleEmittedSet.delete(symbol)) {
+        this.emit('persistentStaleRecovered', symbol);
+      }
     }
 
     const isNewCandle = kline.openTimestamp > lastKline.openTimestamp;
@@ -466,6 +562,57 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     logger.info({ intervalMs: STALENESS_CHECK_INTERVAL_MS }, `[MarketData] Staleness watchdog started (check every ${STALENESS_CHECK_INTERVAL_MS / 1000}s) [${this.interval}]`);
   }
 
+  private startSilenceWatchdog(): void {
+    this.silenceSchedulerHandle = startIntervalScheduler({
+      tickHandler: () => this.silenceScan(),
+      intervalMs: SILENCE_CHECK_INTERVAL_MS,
+      contextLabel: `[MarketData] Silence scan failed [${this.interval}]`,
+    });
+
+    logger.info({ intervalMs: SILENCE_CHECK_INTERVAL_MS, thresholdMs: SILENCE_THRESHOLD_MS }, `[MarketData] Silence watchdog started (check every ${SILENCE_CHECK_INTERVAL_MS / 1000}s, threshold ${SILENCE_THRESHOLD_MS / 1000}s) [${this.interval}]`);
+  }
+
+  private silenceScan(): void {
+    if (this.subscriptionBySymbol.size === 0 || this.lastInboundAtMs === 0) {
+      return;
+    }
+
+    const silenceMs = Date.now() - this.lastInboundAtMs;
+
+    if (silenceMs <= SILENCE_THRESHOLD_MS || this.isStreamSilent) {
+      return;
+    }
+
+    this.isStreamSilent = true;
+    logger.warn({ silenceMs, thresholdMs: SILENCE_THRESHOLD_MS, subscriptionCount: this.subscriptionBySymbol.size }, `[MarketData] Stream SILENT — no inbound message for ${Math.round(silenceMs / 1000)}s across ${this.subscriptionBySymbol.size} subscriptions [${this.interval}]`);
+    this.emit('streamSilent', silenceMs);
+  }
+
+  private startVolumeRefreshScheduler(): void {
+    this.volumeSchedulerHandle = startIntervalScheduler({
+      tickHandler: () => this.refreshVolumes(),
+      intervalMs: VOLUME_REFRESH_INTERVAL_MS,
+      contextLabel: `[MarketData] Volume refresh failed [${this.interval}]`,
+    });
+  }
+
+  private refreshVolumes(): void {
+    for (const symbol of this.klineListBySymbol.keys()) {
+      const volume24hUsdt = this.getVolume24h(symbol);
+
+      if (!Number.isFinite(volume24hUsdt)) {
+        continue;
+      }
+
+      if (this.lastEmittedVolumeBySymbol.get(symbol) === volume24hUsdt) {
+        continue;
+      }
+
+      this.lastEmittedVolumeBySymbol.set(symbol, volume24hUsdt);
+      this.emit('volume24h', symbol, volume24hUsdt);
+    }
+  }
+
   private stalenessScan(): void {
     const intervalMs = resolveIntervalMs(this.interval);
     const thresholdMs = STALENESS_THRESHOLD_MULTIPLIER * intervalMs;
@@ -490,19 +637,36 @@ class MarketDataManager extends EventEmitter implements FeederSource {
       const nextCount = previousCount + 1;
       this.consecutiveStaleScanCountBySymbol.set(symbol, nextCount);
 
-      if (nextCount === PERSISTENT_STALE_THRESHOLD_TICK_COUNT && this.onPersistentStaleSymbol !== null) {
+      if (nextCount === PERSISTENT_STALE_THRESHOLD_TICK_COUNT) {
         logger.warn({ symbol, count: nextCount }, `[MarketData] ${symbol} Persistent stale threshold reached (${nextCount} consecutive stale ticks) [${this.interval}]`);
-
-        try {
-          this.onPersistentStaleSymbol(symbol);
-        } catch (error: unknown) {
-          logger.error({ error, symbol }, `[MarketData] ${symbol} onPersistentStaleSymbol callback threw [${this.interval}]`);
-        }
+        this.persistentStaleEmittedSet.add(symbol);
+        this.emit('persistentStaleSymbol', symbol);
       }
     }
 
     if (staleCount > 0) {
       logger.warn({ staleCount, totalSymbols: this.klineListBySymbol.size }, `[MarketData] Staleness scan found ${staleCount} stale symbol(s) out of ${this.klineListBySymbol.size} [${this.interval}]`);
+    }
+
+    this.evaluateMassStale(staleCount);
+  }
+
+  private evaluateMassStale(staleCount: number): void {
+    const symbolCount = this.klineListBySymbol.size;
+    const isMassStaleNow = crossesMassStaleThreshold({ staleCount, symbolCount, ratioThreshold: MASS_STALE_RATIO_THRESHOLD, minSymbols: MASS_STALE_MIN_SYMBOLS });
+
+    if (isMassStaleNow && !this.isMassStale) {
+      this.isMassStale = true;
+      logger.warn({ staleCount, symbolCount }, `[MarketData] MASS STALE — ${staleCount}/${symbolCount} symbols stale, escalating as a whole-source degradation [${this.interval}]`);
+      this.emit('sourceMassStale', staleCount, symbolCount);
+
+      return;
+    }
+
+    if (!isMassStaleNow && this.isMassStale) {
+      this.isMassStale = false;
+      logger.info({ staleCount, symbolCount }, `[MarketData] Mass stale recovered — ${staleCount}/${symbolCount} symbols stale [${this.interval}]`);
+      this.emit('sourceMassStaleRecovered', staleCount, symbolCount);
     }
   }
 

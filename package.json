@@ -20,6 +20,7 @@
     "deploy:all": "yarn build && ssh root@82.26.198.214 'mkdir -p /opt/market-data-feeder-binance /opt/market-data-feeder-bybit' && rsync --archive --compress --delete .env.binance dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-binance/ && rsync --archive --compress --delete .env.bybit dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-bybit/ && ssh root@82.26.198.214 'cd /opt/market-data-feeder-binance && mv .env.binance .env && cd /opt/market-data-feeder-bybit && mv .env.bybit .env'"
   },
   "dependencies": {
+    "@solncebro/telegram-engine": "file:../telegram-engine",
     "@solncebro/trade-engine": "file:../trade-engine",
     "@solncebro/websocket-engine": "file:../websocket-engine",
     "dotenv": "^16.4.5",

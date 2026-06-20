@@ -1,5 +1,5 @@
 import type { Kline, KlineInterval, MaValues, StaleSymbolInfo } from '../domain/marketData.types.js';
-import type { KlineTickListener, KlineWithMaListener, SymbolNameListener } from '../domain/events.types.js';
+import type { ConnectionLostListener, ConnectionRestoredListener, KlineTickListener, KlineWithMaListener, SymbolNameListener } from '../domain/events.types.js';
 
 interface MarketDataSource {
   getInterval: () => KlineInterval;
@@ -16,9 +16,13 @@ interface MarketDataSource {
   on(eventName: 'klineClosed' | 'klineUpdated', listener: KlineWithMaListener): this;
   on(eventName: 'klineUpdatedTick', listener: KlineTickListener): this;
   on(eventName: 'symbolAdded' | 'symbolRemoved', listener: SymbolNameListener): this;
+  on(eventName: 'connectionLost', listener: ConnectionLostListener): this;
+  on(eventName: 'connectionRestored', listener: ConnectionRestoredListener): this;
   off(eventName: 'klineClosed' | 'klineUpdated', listener: KlineWithMaListener): this;
   off(eventName: 'klineUpdatedTick', listener: KlineTickListener): this;
   off(eventName: 'symbolAdded' | 'symbolRemoved', listener: SymbolNameListener): this;
+  off(eventName: 'connectionLost', listener: ConnectionLostListener): this;
+  off(eventName: 'connectionRestored', listener: ConnectionRestoredListener): this;
 }
 
 export type { MarketDataSource };

@@ -6,6 +6,8 @@ interface EnvConfig {
   exchangeSecret: string;
   port: number;
   host: string;
+  telegramBotToken: string;
+  telegramAllowedChatIdList: string[];
 }
 
 export type { EnvConfig };

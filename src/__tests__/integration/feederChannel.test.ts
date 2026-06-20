@@ -1,9 +1,10 @@
 import { EventEmitter } from 'node:events';
 
+import { WebSocket } from 'ws';
 import { describe, expect, it } from 'vitest';
 import type { WebSocketLogger } from '@solncebro/websocket-engine';
 
-import type { Kline, KlineInterval, MaValues } from '../../domain/marketData.types.js';
+import type { Kline, KlineInterval, MaValues, StaleSymbolInfo } from '../../domain/marketData.types.js';
 import type { FeederSource } from '../../server/feederSource.types.js';
 import type { FeederLogger } from '../../server/feederServer.types.js';
 import { FeederServer } from '../../server/feederServer.js';
@@ -86,6 +87,42 @@ class FakeFeederSource extends EventEmitter implements FeederSource {
     return this.interval;
   }
 
+  getIntervalMs(): number {
+    return 1_800_000;
+  }
+
+  getKlineCount(): number {
+    let total = 0;
+
+    for (const klineList of this.klineListBySymbol.values()) {
+      total += klineList.length;
+    }
+
+    return total;
+  }
+
+  getSubscriptionCount(): number {
+    return this.klineListBySymbol.size;
+  }
+
+  getStaleSymbolList(): StaleSymbolInfo[] {
+    return [];
+  }
+
+  getLastKlineOpenTimestamp(symbol: string): number | undefined {
+    const klineList = this.klineListBySymbol.get(symbol);
+
+    if (klineList === undefined || klineList.length === 0) {
+      return undefined;
+    }
+
+    return klineList[klineList.length - 1].openTimestamp;
+  }
+
+  getLastUpdateTimestamp(): number | undefined {
+    return undefined;
+  }
+
   getSymbolList(): string[] {
     return Array.from(this.klineListBySymbol.keys());
   }
@@ -105,6 +142,34 @@ class FakeFeederSource extends EventEmitter implements FeederSource {
   getVolume24h(): number {
     return 5_000_000;
   }
+
+  getStreamLiveness(): { lastInboundAtMs: number; silenceMs: number; isStreamSilent: boolean } {
+    return { lastInboundAtMs: Date.now(), silenceMs: 0, isStreamSilent: false };
+  }
+
+  getFreshSymbolCount(): number {
+    return this.klineListBySymbol.size;
+  }
+
+  getPersistentStaleCount(): number {
+    return 0;
+  }
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs: number = 2000): Promise<void> {
+  const startedAtMs = Date.now();
+
+  while (!predicate()) {
+    if (Date.now() - startedAtMs > timeoutMs) {
+      throw new Error('waitFor timed out');
+    }
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function findAllSubscriberCount(server: FeederServer): number {
+  return server.getStatus().intervalStatusList.find((item) => item.interval === '30m')?.allSubscriberCount ?? 0;
 }
 
 function buildClient(port: number, events: ('klineClosed' | 'klineUpdated' | 'klineUpdatedTick')[]): MarketDataClient {
@@ -217,6 +282,68 @@ describe('feeder channel', () => {
       expect(await removedPromise).toBe('BTCUSDT');
       expect(client.getSymbolList()).toEqual(['ETHUSDT']);
       expect(client.getKlineList('BTCUSDT')).toEqual([]);
+    } finally {
+      client.close();
+      await server.shutdown();
+    }
+  });
+
+  it('releases the registry subscription when a client disconnects during the initial load', async () => {
+    let isLoadStarted = false;
+    let resolveLoad: (() => void) | null = null;
+    const source = new FakeFeederSource('30m', new Map([['BTCUSDT', [makeKline(1000)]]]));
+    source.loadAllSymbols = () => {
+      isLoadStarted = true;
+
+      return new Promise<void>((resolve) => {
+        resolveLoad = resolve;
+      });
+    };
+    const server = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => source });
+    await server.start();
+
+    const socket = new WebSocket(`ws://127.0.0.1:${server.getPort()}`);
+
+    try {
+      await new Promise<void>((resolve) => socket.on('open', () => resolve()));
+      socket.send(JSON.stringify({ type: 'subscribe', interval: '30m', scope: { kind: 'all' }, events: ['klineClosed'], wantMa: true }));
+
+      await waitFor(() => isLoadStarted);
+
+      const closePromise = new Promise<void>((resolve) => socket.on('close', () => resolve()));
+      socket.close();
+      await closePromise;
+
+      await waitFor(() => server.getStatus().clientCount === 0);
+
+      expect(findAllSubscriberCount(server)).toBe(0);
+
+      resolveLoad?.();
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+      expect(findAllSubscriberCount(server)).toBe(0);
+    } finally {
+      resolveLoad?.();
+      await server.shutdown();
+    }
+  });
+
+  it('forwards a live volume24h update into the client mirror regardless of the event set', async () => {
+    const source = new FakeFeederSource('30m', new Map([['BTCUSDT', [makeKline(1000)]]]));
+    const server = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => source });
+    await server.start();
+
+    const client = buildClient(server.getPort(), ['klineClosed']);
+
+    try {
+      await client.waitUntilReady(3000);
+      expect(client.getVolume24h('BTCUSDT')).toBe(5_000_000);
+
+      source.emit('volume24h', 'BTCUSDT', 7_777_777);
+
+      await waitFor(() => client.getVolume24h('BTCUSDT') === 7_777_777);
+
+      expect(client.getVolume24h('BTCUSDT')).toBe(7_777_777);
     } finally {
       client.close();
       await server.shutdown();

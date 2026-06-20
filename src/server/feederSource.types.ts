@@ -1,6 +1,12 @@
-import type { Kline, MaValues } from '../domain/marketData.types.js';
-import type { KlineTickListener, KlineWithMaListener, SymbolNameListener } from '../domain/events.types.js';
+import type { Kline, MaValues, StaleSymbolInfo } from '../domain/marketData.types.js';
+import type { IntervalLoadListener, KlineTickListener, KlineWithMaListener, SourceMassStaleListener, StreamSilenceListener, SymbolNameListener, Volume24hListener } from '../domain/events.types.js';
 import type { ManagedSource } from './subscriptionRegistry.types.js';
+
+interface StreamLiveness {
+  lastInboundAtMs: number;
+  silenceMs: number;
+  isStreamSilent: boolean;
+}
 
 interface FeederSource extends ManagedSource {
   getSymbolList: () => string[];
@@ -8,12 +14,29 @@ interface FeederSource extends ManagedSource {
   getMaValues: (symbol: string) => MaValues;
   getCurrentKline: (symbol: string) => Kline | undefined;
   getVolume24h: (symbol: string) => number;
+  getIntervalMs: () => number;
+  getKlineCount: () => number;
+  getSubscriptionCount: () => number;
+  getStaleSymbolList: () => StaleSymbolInfo[];
+  getLastKlineOpenTimestamp: (symbol: string) => number | undefined;
+  getLastUpdateTimestamp: (symbol: string) => number | undefined;
+  getStreamLiveness: () => StreamLiveness;
+  getFreshSymbolCount: () => number;
+  getPersistentStaleCount: () => number;
   on(eventName: 'klineClosed' | 'klineUpdated', listener: KlineWithMaListener): this;
   on(eventName: 'klineUpdatedTick', listener: KlineTickListener): this;
-  on(eventName: 'symbolAdded' | 'symbolRemoved', listener: SymbolNameListener): this;
+  on(eventName: 'symbolAdded' | 'symbolRemoved' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted', listener: SymbolNameListener): this;
+  on(eventName: 'volume24h', listener: Volume24hListener): this;
+  on(eventName: 'streamSilent' | 'streamResumed', listener: StreamSilenceListener): this;
+  on(eventName: 'sourceMassStale' | 'sourceMassStaleRecovered', listener: SourceMassStaleListener): this;
+  on(eventName: 'intervalLoadStarted' | 'intervalLoadCompleted', listener: IntervalLoadListener): this;
   off(eventName: 'klineClosed' | 'klineUpdated', listener: KlineWithMaListener): this;
   off(eventName: 'klineUpdatedTick', listener: KlineTickListener): this;
-  off(eventName: 'symbolAdded' | 'symbolRemoved', listener: SymbolNameListener): this;
+  off(eventName: 'symbolAdded' | 'symbolRemoved' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted', listener: SymbolNameListener): this;
+  off(eventName: 'volume24h', listener: Volume24hListener): this;
+  off(eventName: 'streamSilent' | 'streamResumed', listener: StreamSilenceListener): this;
+  off(eventName: 'sourceMassStale' | 'sourceMassStaleRecovered', listener: SourceMassStaleListener): this;
+  off(eventName: 'intervalLoadStarted' | 'intervalLoadCompleted', listener: IntervalLoadListener): this;
 }
 
-export type { FeederSource };
+export type { FeederSource, StreamLiveness };

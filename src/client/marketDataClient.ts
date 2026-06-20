@@ -7,6 +7,7 @@ import { KLINE_BUFFER_SIZE, STALENESS_THRESHOLD_MULTIPLIER, resolveIntervalMs } 
 import type { FeederMessage, SubscribeMessage } from '../protocol/messages.types.js';
 import { decodeMessage, encodeMessage } from '../protocol/codec.js';
 import { MirrorStore } from './mirrorStore.js';
+import { isDataFreshnessMessage, isDataStale } from './dataStaleness.js';
 import type { MarketDataSource } from './marketDataSource.types.js';
 import type { MarketDataClientArgs } from './marketDataClient.types.js';
 
@@ -23,7 +24,8 @@ class MarketDataClient extends EventEmitter implements MarketDataSource {
   private readonly socket: ReliableWebSocket<FeederMessage | null>;
   private snapshotSymbolSet: Set<string> = new Set();
   private isSnapshotComplete: boolean = false;
-  private lastMessageMs: number = 0;
+  private isConnectionLost: boolean = false;
+  private lastDataMessageMs: number = 0;
   private resolveReady: (() => void) | null = null;
 
   constructor(args: MarketDataClientArgs) {
@@ -38,13 +40,20 @@ class MarketDataClient extends EventEmitter implements MarketDataSource {
       logger: args.logger,
       parseMessage: (rawData) => decodeMessage(rawData.toString()),
       onMessage: (message) => {
-        this.lastMessageMs = Date.now();
         this.handleMessage(message);
       },
       onOpen: async (context) => {
         this.isSnapshotComplete = false;
         this.snapshotSymbolSet = new Set();
         context.send(encodeMessage(this.subscribeMessage));
+      },
+      onNotify: (reason: string) => {
+        if (this.isConnectionLost) {
+          return;
+        }
+
+        this.isConnectionLost = true;
+        this.emit('connectionLost', reason);
       },
       configuration: { staleThreshold: CLIENT_STALE_THRESHOLD_MS, staleCheckInterval: CLIENT_STALE_CHECK_INTERVAL_MS },
     });
@@ -113,11 +122,12 @@ class MarketDataClient extends EventEmitter implements MarketDataSource {
   }
 
   isStale(): boolean {
-    if (!this.isSnapshotComplete) {
-      return true;
-    }
-
-    return Date.now() - this.lastMessageMs > CLIENT_STALE_THRESHOLD_MS;
+    return isDataStale({
+      isSnapshotComplete: this.isSnapshotComplete,
+      lastDataMessageMs: this.lastDataMessageMs,
+      nowMs: Date.now(),
+      thresholdMs: CLIENT_STALE_THRESHOLD_MS,
+    });
   }
 
   getStaleSymbolList(): StaleSymbolInfo[] {
@@ -149,6 +159,10 @@ class MarketDataClient extends EventEmitter implements MarketDataSource {
   private handleMessage(message: FeederMessage | null): void {
     if (message === null) {
       return;
+    }
+
+    if (isDataFreshnessMessage(message.type)) {
+      this.lastDataMessageMs = Date.now();
     }
 
     if (message.type === 'snapshot') {
@@ -214,6 +228,11 @@ class MarketDataClient extends EventEmitter implements MarketDataSource {
 
   private markReady(): void {
     this.isSnapshotComplete = true;
+
+    if (this.isConnectionLost) {
+      this.isConnectionLost = false;
+      this.emit('connectionRestored');
+    }
 
     if (this.resolveReady !== null) {
       const resolve = this.resolveReady;

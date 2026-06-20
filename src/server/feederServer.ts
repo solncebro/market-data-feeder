@@ -1,13 +1,14 @@
 import { WebSocket, WebSocketServer } from 'ws';
 
-import type { KlineInterval } from '../domain/marketData.types.js';
+import type { KlineInterval, StaleSymbolInfo } from '../domain/marketData.types.js';
 import type { FeedEventName, SubscriptionScope } from '../domain/subscription.types.js';
 import type { MarketDataSnapshotEntry } from '../domain/snapshot.types.js';
-import type { ServerMessage, SnapshotMessage, SubscribeMessage, SymbolAddedMessage, SymbolRemovedMessage, UnsubscribeMessage } from '../protocol/messages.types.js';
+import type { ServerMessage, SnapshotMessage, SubscribeMessage, SymbolAddedMessage, SymbolRemovedMessage, UnsubscribeMessage, Volume24hMessage } from '../protocol/messages.types.js';
 import { decodeMessage, encodeMessage } from '../protocol/codec.js';
 import { SubscriptionRegistry } from './subscriptionRegistry.js';
+import type { HealthEvent } from '../health/healthMonitor.types.js';
 import type { FeederSource } from './feederSource.types.js';
-import type { FeederLogger, FeederServerArgs, ForwardFeedMessageArgs } from './feederServer.types.js';
+import type { FeederLogger, FeederServerArgs, FeederStatus, ForwardFeedMessageArgs, IntervalStatus, SymbolDiagnostics } from './feederServer.types.js';
 
 const DEFAULT_SNAPSHOT_CHUNK_SIZE = 100;
 const HEARTBEAT_INTERVAL_MS = 15_000;
@@ -42,6 +43,8 @@ class FeederServer {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private symbolSyncTimer: ReturnType<typeof setInterval> | null = null;
   private boundPort: number;
+  private startedAtMs: number = 0;
+  private readonly onHealthEvent: ((event: HealthEvent) => void) | null;
 
   constructor(args: FeederServerArgs) {
     this.port = args.port;
@@ -49,6 +52,7 @@ class FeederServer {
     this.logger = args.logger;
     this.snapshotChunkSize = args.snapshotChunkSize ?? DEFAULT_SNAPSHOT_CHUNK_SIZE;
     this.boundPort = args.port;
+    this.onHealthEvent = args.onHealthEvent ?? null;
     this.registry = new SubscriptionRegistry<FeederSource>({
       createSource: (interval) => this.createForwardingSource(interval, args.createSource),
     });
@@ -78,6 +82,7 @@ class FeederServer {
       this.boundPort = address.port;
     }
 
+    this.startedAtMs = Date.now();
     this.startHeartbeat();
     this.startSymbolListSync();
     this.logger.info({ port: this.boundPort, host: this.host }, `[Feeder] WebSocket server listening on ${this.host}:${this.boundPort}`);
@@ -85,6 +90,87 @@ class FeederServer {
 
   getPort(): number {
     return this.boundPort;
+  }
+
+  getStatus(): FeederStatus {
+    const intervalStatusList: IntervalStatus[] = [];
+
+    for (const registrationStatus of this.registry.getRegistrationStatusList()) {
+      const source = this.registry.getSource(registrationStatus.interval);
+
+      if (source === undefined) {
+        continue;
+      }
+
+      intervalStatusList.push({
+        interval: registrationStatus.interval,
+        intervalMs: source.getIntervalMs(),
+        isAllLoaded: registrationStatus.isAllLoaded,
+        allSubscriberCount: registrationStatus.allSubscriberCount,
+        refSymbolCount: registrationStatus.refSymbolCount,
+        symbolCount: source.getSymbolList().length,
+        klineCount: source.getKlineCount(),
+        staleCount: source.getStaleSymbolList().length,
+        subscriptionCount: source.getSubscriptionCount(),
+        liveness: source.getStreamLiveness(),
+        freshCount: source.getFreshSymbolCount(),
+        persistentStaleCount: source.getPersistentStaleCount(),
+      });
+    }
+
+    return {
+      host: this.host,
+      port: this.boundPort,
+      clientCount: this.clientSet.size,
+      uptimeMs: this.startedAtMs > 0 ? Date.now() - this.startedAtMs : 0,
+      intervalStatusList,
+    };
+  }
+
+  getStaleSymbolList(interval: KlineInterval, limit: number): StaleSymbolInfo[] {
+    const source = this.registry.getSource(interval);
+
+    if (source === undefined) {
+      return [];
+    }
+
+    return source.getStaleSymbolList().slice(0, limit);
+  }
+
+  getSymbolDiagnostics(symbol: string, interval?: KlineInterval): SymbolDiagnostics | null {
+    const intervalList = interval !== undefined ? [interval] : this.registry.getLoadedIntervalList();
+
+    for (const candidateInterval of intervalList) {
+      const source = this.registry.getSource(candidateInterval);
+
+      if (source === undefined || !source.getSymbolList().includes(symbol)) {
+        continue;
+      }
+
+      return this.buildSymbolDiagnostics(source, candidateInterval, symbol);
+    }
+
+    return null;
+  }
+
+  private buildSymbolDiagnostics(source: FeederSource, interval: KlineInterval, symbol: string): SymbolDiagnostics {
+    const klineList = source.getKlineList(symbol);
+    const lastKline = klineList.length > 0 ? klineList[klineList.length - 1] : undefined;
+    const lastPrice = source.getCurrentKline(symbol)?.closePrice ?? lastKline?.closePrice ?? null;
+    const volume24hUsdt = source.getVolume24h(symbol);
+    const staleInfo = source.getStaleSymbolList().find((info) => info.symbol === symbol);
+
+    return {
+      symbol,
+      interval,
+      lastPrice,
+      lastKlineOpenMs: source.getLastKlineOpenTimestamp(symbol),
+      lastUpdateMs: source.getLastUpdateTimestamp(symbol),
+      maValues: source.getMaValues(symbol),
+      volume24hUsdt: Number.isFinite(volume24hUsdt) ? volume24hUsdt : null,
+      isStale: staleInfo !== undefined,
+      staleAgeMs: staleInfo?.ageMs,
+    };
   }
 
   async shutdown(): Promise<void> {
@@ -142,7 +228,59 @@ class FeederServer {
       this.forwardSymbolRemoved(interval, symbol);
     });
 
+    source.on('volume24h', (symbol, volume24hUsdt) => {
+      this.forwardVolume24h(interval, symbol, volume24hUsdt);
+    });
+
+    source.on('streamSilent', (silenceMs) => {
+      this.emitHealthEvent({ kind: 'streamSilent', interval, silenceMs });
+    });
+
+    source.on('streamResumed', (silenceMs) => {
+      this.emitHealthEvent({ kind: 'streamResumed', interval, silenceMs });
+    });
+
+    source.on('sourceMassStale', (staleCount, symbolCount) => {
+      this.emitHealthEvent({ kind: 'sourceMassStale', interval, staleCount, symbolCount });
+    });
+
+    source.on('sourceMassStaleRecovered', () => {
+      this.emitHealthEvent({ kind: 'sourceMassStaleRecovered', interval });
+    });
+
+    source.on('persistentStaleSymbol', (symbol) => {
+      this.emitHealthEvent({ kind: 'persistentStaleSymbol', interval, symbol });
+    });
+
+    source.on('persistentStaleRecovered', (symbol) => {
+      this.emitHealthEvent({ kind: 'persistentStaleRecovered', interval, symbol });
+    });
+
+    source.on('intervalLoadStarted', (symbolCount) => {
+      this.emitHealthEvent({ kind: 'intervalLoadStarted', interval, symbolCount });
+    });
+
+    source.on('intervalLoadCompleted', (symbolCount) => {
+      this.emitHealthEvent({ kind: 'intervalLoadCompleted', interval, symbolCount });
+    });
+
+    source.on('symbolLoadCompleted', (symbol) => {
+      this.emitHealthEvent({ kind: 'symbolLoadCompleted', interval, symbol });
+    });
+
     return source;
+  }
+
+  private emitHealthEvent(event: HealthEvent): void {
+    if (this.onHealthEvent === null) {
+      return;
+    }
+
+    try {
+      this.onHealthEvent(event);
+    } catch (error: unknown) {
+      this.logger.error({ error }, '[Feeder] onHealthEvent handler threw');
+    }
   }
 
   private handleConnection(socket: WebSocket): void {
@@ -187,10 +325,26 @@ class FeederServer {
   }
 
   private async handleSubscribe(client: ClientConnection, message: SubscribeMessage): Promise<void> {
-    const source = await this.registry.subscribe({ interval: message.interval, scope: message.scope });
-    const snapshotMessageList = this.buildSnapshotMessageList(source, message.interval, message.scope);
+    const subscription: ClientSubscription = { scope: message.scope, eventNameSet: new Set(message.events) };
+    client.subscriptionByInterval.set(message.interval, subscription);
 
-    client.subscriptionByInterval.set(message.interval, { scope: message.scope, eventNameSet: new Set(message.events) });
+    let source: FeederSource;
+
+    try {
+      source = await this.registry.subscribe({ interval: message.interval, scope: message.scope });
+    } catch (error: unknown) {
+      if (client.subscriptionByInterval.get(message.interval) === subscription) {
+        client.subscriptionByInterval.delete(message.interval);
+      }
+
+      throw error;
+    }
+
+    if (!this.clientSet.has(client)) {
+      return;
+    }
+
+    const snapshotMessageList = this.buildSnapshotMessageList(source, message.interval, message.scope);
 
     for (const snapshotMessage of snapshotMessageList) {
       this.sendMessage(client, snapshotMessage);
@@ -261,21 +415,23 @@ class FeederServer {
 
   private forwardSymbolAdded(source: FeederSource, interval: KlineInterval, symbol: string): void {
     const message: SymbolAddedMessage = { type: 'symbolAdded', interval, entry: this.buildSnapshotEntry(source, symbol) };
-    const encoded = encodeMessage(message);
 
-    for (const client of this.clientSet) {
-      const subscription = client.subscriptionByInterval.get(interval);
-
-      if (subscription === undefined || !scopeMatchesSymbol(subscription.scope, symbol)) {
-        continue;
-      }
-
-      this.sendRaw(client, encoded);
-    }
+    this.broadcastScoped(interval, symbol, message);
   }
 
   private forwardSymbolRemoved(interval: KlineInterval, symbol: string): void {
     const message: SymbolRemovedMessage = { type: 'symbolRemoved', interval, symbol };
+
+    this.broadcastScoped(interval, symbol, message);
+  }
+
+  private forwardVolume24h(interval: KlineInterval, symbol: string, volume24hUsdt: number): void {
+    const message: Volume24hMessage = { type: 'volume24h', interval, symbol, volume24hUsdt };
+
+    this.broadcastScoped(interval, symbol, message);
+  }
+
+  private broadcastScoped(interval: KlineInterval, symbol: string, message: ServerMessage): void {
     const encoded = encodeMessage(message);
 
     for (const client of this.clientSet) {

@@ -21,4 +21,11 @@ interface SubscriptionRegistryArgs<TSource extends ManagedSource> {
   teardownDelayMs?: number;
 }
 
-export type { ManagedSource, SubscribeArgs, SubscriptionRegistryArgs };
+interface RegistrationStatus {
+  interval: KlineInterval;
+  isAllLoaded: boolean;
+  allSubscriberCount: number;
+  refSymbolCount: number;
+}
+
+export type { ManagedSource, RegistrationStatus, SubscribeArgs, SubscriptionRegistryArgs };

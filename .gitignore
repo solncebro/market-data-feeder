@@ -8,3 +8,4 @@ dist/
 firebase-sa.json
 *.log
 .DS_Store
+logs/

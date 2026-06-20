@@ -45,6 +45,20 @@ function resolvePort(): number {
   return parsed;
 }
 
+function resolveAllowedChatIdList(): string[] {
+  const raw = requireEnv('TELEGRAM_ALLOWED_CHAT_IDS');
+  const chatIdList = raw
+    .split(',')
+    .map((chatId) => chatId.trim())
+    .filter((chatId) => chatId !== '');
+
+  if (chatIdList.length === 0) {
+    throw new Error('Invalid TELEGRAM_ALLOWED_CHAT_IDS — expected a comma-separated list of at least one chat id');
+  }
+
+  return chatIdList;
+}
+
 function loadEnvConfig(): EnvConfig {
   return {
     exchangeName: resolveExchangeName(requireEnv('EXCHANGE_NAME')),
@@ -52,6 +66,8 @@ function loadEnvConfig(): EnvConfig {
     exchangeSecret: requireEnv('EXCHANGE_SECRET'),
     port: resolvePort(),
     host: process.env.MARKET_DATA_FEEDER_HOST ?? DEFAULT_HOST,
+    telegramBotToken: requireEnv('TELEGRAM_BOT_TOKEN'),
+    telegramAllowedChatIdList: resolveAllowedChatIdList(),
   };
 }
 

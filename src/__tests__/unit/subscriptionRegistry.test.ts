@@ -149,6 +149,29 @@ describe('SubscriptionRegistry', () => {
     expect(createdByInterval.get('5m')?.syncAllSymbols).not.toHaveBeenCalled();
   });
 
+  it('reports per-interval registration status (all-loaded vs symbol-subset)', async () => {
+    const { registry } = makeRegistry();
+    await registry.subscribe({ interval: '30m', scope: { kind: 'all' } });
+    await registry.subscribe({ interval: '30m', scope: { kind: 'all' } });
+    await registry.subscribe({ interval: '5m', scope: { kind: 'symbols', symbolList: ['BTCUSDT', 'ETHUSDT'] } });
+
+    const statusList = registry.getRegistrationStatusList();
+    const status30m = statusList.find((status) => status.interval === '30m');
+    const status5m = statusList.find((status) => status.interval === '5m');
+
+    expect(statusList).toHaveLength(2);
+    expect(status30m).toEqual({ interval: '30m', isAllLoaded: true, allSubscriberCount: 2, refSymbolCount: 0 });
+    expect(status5m).toEqual({ interval: '5m', isAllLoaded: false, allSubscriberCount: 0, refSymbolCount: 2 });
+  });
+
+  it('drops a torn-down interval from the registration status list', async () => {
+    const { registry } = makeRegistry();
+    await registry.subscribe({ interval: '30m', scope: { kind: 'all' } });
+    await registry.unsubscribe({ interval: '30m', scope: { kind: 'all' } });
+
+    expect(registry.getRegistrationStatusList()).toHaveLength(0);
+  });
+
   it('shuts every source down on registry shutdown', async () => {
     const { registry, createdByInterval } = makeRegistry();
     await registry.subscribe({ interval: '30m', scope: { kind: 'all' } });
@@ -236,5 +259,45 @@ describe('SubscriptionRegistry', () => {
     expect(isFirstResolved).toBe(true);
     expect(isSecondResolved).toBe(true);
     expect(source.ensureSymbolLoaded).toHaveBeenCalledTimes(1);
+  });
+
+  it('rolls back the all-subscriber count when the initial load fails', async () => {
+    const source = makeFakeSource('30m');
+    source.loadAllSymbols.mockRejectedValue(new Error('load failed'));
+    const registry = new SubscriptionRegistry<FakeSource>({ createSource: () => source, teardownDelayMs: 0 });
+
+    await expect(registry.subscribe({ interval: '30m', scope: { kind: 'all' } })).rejects.toThrow('load failed');
+
+    const status = registry.getRegistrationStatusList().find((item) => item.interval === '30m');
+
+    expect(status?.allSubscriberCount ?? 0).toBe(0);
+  });
+
+  it('retries the load for a fresh subscriber after a previous load failed', async () => {
+    const source = makeFakeSource('30m');
+    source.loadAllSymbols
+      .mockRejectedValueOnce(new Error('load failed'))
+      .mockResolvedValueOnce(undefined);
+    const registry = new SubscriptionRegistry<FakeSource>({ createSource: () => source, teardownDelayMs: 0 });
+
+    await expect(registry.subscribe({ interval: '30m', scope: { kind: 'all' } })).rejects.toThrow('load failed');
+    await registry.subscribe({ interval: '30m', scope: { kind: 'all' } });
+
+    const status = registry.getRegistrationStatusList().find((item) => item.interval === '30m');
+
+    expect(status?.allSubscriberCount).toBe(1);
+    expect(status?.isAllLoaded).toBe(true);
+  });
+
+  it('rolls back the symbol ref-count when an on-demand load fails', async () => {
+    const source = makeFakeSource('30m');
+    source.ensureSymbolLoaded.mockRejectedValue(new Error('symbol load failed'));
+    const registry = new SubscriptionRegistry<FakeSource>({ createSource: () => source, teardownDelayMs: 0 });
+
+    await expect(registry.subscribe({ interval: '30m', scope: { kind: 'symbols', symbolList: ['BTCUSDT'] } })).rejects.toThrow('symbol load failed');
+
+    const status = registry.getRegistrationStatusList().find((item) => item.interval === '30m');
+
+    expect(status?.refSymbolCount ?? 0).toBe(0);
   });
 });

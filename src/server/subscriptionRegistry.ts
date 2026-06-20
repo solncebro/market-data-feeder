@@ -1,5 +1,5 @@
 import type { KlineInterval } from '../domain/marketData.types.js';
-import type { ManagedSource, SubscribeArgs, SubscriptionRegistryArgs } from './subscriptionRegistry.types.js';
+import type { ManagedSource, RegistrationStatus, SubscribeArgs, SubscriptionRegistryArgs } from './subscriptionRegistry.types.js';
 
 const DEFAULT_TEARDOWN_DELAY_MS = 30_000;
 
@@ -31,13 +31,33 @@ class SubscriptionRegistry<TSource extends ManagedSource> {
     if (args.scope.kind === 'all') {
       registration.allSubscriberCount += 1;
 
-      await this.ensureAllLoaded(registration);
+      try {
+        await this.ensureAllLoaded(registration);
+      } catch (error: unknown) {
+        registration.allSubscriberCount = Math.max(0, registration.allSubscriberCount - 1);
+        await this.teardownIfIdle(args.interval, registration);
+
+        throw error;
+      }
 
       return registration.source;
     }
 
-    for (const symbol of args.scope.symbolList) {
-      await this.acquireSymbol(registration, symbol);
+    const acquiredSymbolList: string[] = [];
+
+    try {
+      for (const symbol of args.scope.symbolList) {
+        await this.acquireSymbol(registration, symbol);
+        acquiredSymbolList.push(symbol);
+      }
+    } catch (error: unknown) {
+      for (const symbol of acquiredSymbolList) {
+        this.releaseSymbolRef(registration, symbol);
+      }
+
+      await this.teardownIfIdle(args.interval, registration);
+
+      throw error;
     }
 
     return registration.source;
@@ -77,6 +97,21 @@ class SubscriptionRegistry<TSource extends ManagedSource> {
 
   getLoadedIntervalList(): KlineInterval[] {
     return Array.from(this.registrationByInterval.keys());
+  }
+
+  getRegistrationStatusList(): RegistrationStatus[] {
+    const statusList: RegistrationStatus[] = [];
+
+    for (const [interval, registration] of this.registrationByInterval) {
+      statusList.push({
+        interval,
+        isAllLoaded: registration.isAllLoaded,
+        allSubscriberCount: registration.allSubscriberCount,
+        refSymbolCount: registration.symbolRefCountBySymbol.size,
+      });
+    }
+
+    return statusList;
   }
 
   async shutdown(): Promise<void> {
@@ -146,7 +181,13 @@ class SubscriptionRegistry<TSource extends ManagedSource> {
     const existingLoadPromise = registration.symbolLoadPromiseBySymbol.get(symbol);
 
     if (existingLoadPromise !== undefined) {
-      await existingLoadPromise;
+      try {
+        await existingLoadPromise;
+      } catch (error: unknown) {
+        this.releaseSymbolRef(registration, symbol);
+
+        throw error;
+      }
 
       return;
     }
@@ -160,6 +201,10 @@ class SubscriptionRegistry<TSource extends ManagedSource> {
 
     try {
       await loadPromise;
+    } catch (error: unknown) {
+      this.releaseSymbolRef(registration, symbol);
+
+      throw error;
     } finally {
       registration.symbolLoadPromiseBySymbol.delete(symbol);
     }
