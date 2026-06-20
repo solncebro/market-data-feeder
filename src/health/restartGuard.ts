@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 
 interface RestartGuardLogger {
   warn: (payload: Record<string, unknown>, message: string) => void;
+  error?: (payload: Record<string, unknown>, message: string) => void;
 }
 
 interface RestartGuardArgs {
@@ -57,16 +58,21 @@ function createRestartGuard(args: RestartGuardArgs): RestartGuard {
 
   const canRestart = (): boolean => getRecentRestartCount() < args.maxRestarts;
 
-  const recordRestart = (): void => {
-    const restartList = recentTimestampList();
-    restartList.push(now());
-
+  const persist = (restartList: number[]): void => {
     try {
       writeFileSync(args.filePath, JSON.stringify({ restartList } satisfies RestartGuardState), 'utf8');
     } catch (error: unknown) {
-      args.logger?.warn({ error, filePath: args.filePath }, '[Health] restart guard failed to persist restart log (continuing)');
+      args.logger?.error?.({ error, filePath: args.filePath }, '[Health] restart-log path is not writable — auto-restart loop protection cannot persist its counter');
     }
   };
+
+  const recordRestart = (): void => {
+    const restartList = recentTimestampList();
+    restartList.push(now());
+    persist(restartList);
+  };
+
+  persist(recentTimestampList());
 
   return { canRestart, recordRestart, getRecentRestartCount };
 }

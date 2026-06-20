@@ -261,6 +261,24 @@ describe('SubscriptionRegistry', () => {
     expect(source.ensureSymbolLoaded).toHaveBeenCalledTimes(1);
   });
 
+  it('releases a symbol that was unsubscribed while its on-demand load was still in flight', async () => {
+    const source = makeFakeSource('30m');
+    let resolveLoad: ((value: boolean) => void) | null = null;
+    source.ensureSymbolLoaded.mockImplementation(() => new Promise<boolean>((resolve) => {
+      resolveLoad = resolve;
+    }));
+    const registry = new SubscriptionRegistry<FakeSource>({ createSource: () => source, teardownDelayMs: 100_000 });
+
+    const subscribePromise = registry.subscribe({ interval: '30m', scope: { kind: 'symbols', symbolList: ['BTCUSDT'] } });
+    await registry.unsubscribe({ interval: '30m', scope: { kind: 'symbols', symbolList: ['BTCUSDT'] } });
+
+    resolveLoad!(true);
+    await subscribePromise;
+
+    expect(source.releaseSymbol).toHaveBeenCalledTimes(2);
+    expect(source.releaseSymbol).toHaveBeenLastCalledWith('BTCUSDT');
+  });
+
   it('rolls back the all-subscriber count when the initial load fails', async () => {
     const source = makeFakeSource('30m');
     source.loadAllSymbols.mockRejectedValue(new Error('load failed'));

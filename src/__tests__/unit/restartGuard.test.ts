@@ -69,6 +69,15 @@ describe('createRestartGuard', () => {
     expect(second.canRestart()).toBe(false);
   });
 
+  it('logs an error at startup when the restart-log path is unwritable', () => {
+    let errorCount = 0;
+    const logger = { warn: () => undefined, error: () => { errorCount += 1; } };
+
+    createRestartGuard({ filePath: join(stateDir, 'missing', 'nested.json'), windowMs: 30 * 60_000, maxRestarts: 3, now: () => 1000, logger });
+
+    expect(errorCount).toBeGreaterThan(0);
+  });
+
   it('treats unreadable/corrupt state as no restarts (fail-open) without throwing', () => {
     const guard = createRestartGuard({ filePath: join(stateDir, 'missing', 'nested.json'), windowMs: 30 * 60_000, maxRestarts: 3, now: () => 1000 });
 

@@ -14,6 +14,8 @@ import type { FeederLogger, FeederServerArgs, FeederStatus, ForwardFeedMessageAr
 const DEFAULT_SNAPSHOT_CHUNK_SIZE = 100;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const SYMBOL_LIST_SYNC_INTERVAL_MS = 3_600_000;
+const DEFAULT_MAX_CONNECTIONS = 64;
+const DEFAULT_MAX_PAYLOAD_BYTES = 262_144;
 
 interface ClientSubscription {
   scope: SubscriptionScope;
@@ -46,6 +48,8 @@ class FeederServer {
   private boundPort: number;
   private startedAtMs: number = 0;
   private readonly onHealthEvent: ((event: HealthEvent) => void) | null;
+  private readonly maxConnections: number;
+  private readonly maxPayloadBytes: number;
 
   constructor(args: FeederServerArgs) {
     this.port = args.port;
@@ -54,13 +58,15 @@ class FeederServer {
     this.snapshotChunkSize = args.snapshotChunkSize ?? DEFAULT_SNAPSHOT_CHUNK_SIZE;
     this.boundPort = args.port;
     this.onHealthEvent = args.onHealthEvent ?? null;
+    this.maxConnections = args.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
+    this.maxPayloadBytes = args.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
     this.registry = new SubscriptionRegistry<FeederSource>({
       createSource: (interval) => this.createForwardingSource(interval, args.createSource),
     });
   }
 
   async start(): Promise<void> {
-    const webSocketServer = new WebSocketServer({ port: this.port, host: this.host });
+    const webSocketServer = new WebSocketServer({ port: this.port, host: this.host, maxPayload: this.maxPayloadBytes });
     this.webSocketServer = webSocketServer;
 
     webSocketServer.on('connection', (socket) => {
@@ -68,13 +74,22 @@ class FeederServer {
     });
 
     await new Promise<void>((resolve, reject) => {
-      webSocketServer.once('listening', () => {
+      const onListening = (): void => {
+        webSocketServer.off('error', onStartupError);
         resolve();
-      });
+      };
 
-      webSocketServer.once('error', (error) => {
+      const onStartupError = (error: Error): void => {
+        webSocketServer.off('listening', onListening);
         reject(error);
-      });
+      };
+
+      webSocketServer.once('listening', onListening);
+      webSocketServer.once('error', onStartupError);
+    });
+
+    webSocketServer.on('error', (error: unknown) => {
+      this.logger.error({ error }, '[Feeder] WebSocket server error');
     });
 
     const address = webSocketServer.address();
@@ -289,6 +304,13 @@ class FeederServer {
   }
 
   private handleConnection(socket: WebSocket): void {
+    if (this.clientSet.size >= this.maxConnections) {
+      this.logger.warn({ limit: this.maxConnections }, '[Feeder] connection rejected — client connection limit reached');
+      socket.close();
+
+      return;
+    }
+
     const client: ClientConnection = { socket, subscriptionByInterval: new Map() };
     this.clientSet.add(client);
 

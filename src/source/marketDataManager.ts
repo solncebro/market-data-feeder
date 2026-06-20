@@ -62,6 +62,7 @@ class MarketDataManager extends EventEmitter implements FeederSource {
   private lastInboundAtMs: number = 0;
   private isStreamSilent: boolean = false;
   private isMassStale: boolean = false;
+  private isShutDown: boolean = false;
   private stalenessSchedulerHandle: IntervalSchedulerHandle | null = null;
   private silenceSchedulerHandle: IntervalSchedulerHandle | null = null;
   private volumeSchedulerHandle: IntervalSchedulerHandle | null = null;
@@ -214,6 +215,11 @@ class MarketDataManager extends EventEmitter implements FeederSource {
         () => this.fetchKlinesWithTimeout(exchangeClient.fetchKlines(symbol, this.interval, { limit: KLINE_BUFFER_SIZE }), LOAD_KLINES_TIMEOUT_MS, symbol),
         `ensureSymbolLoaded ${symbol} [${this.interval}]`,
       );
+
+      if (this.isShutDown) {
+        return false;
+      }
+
       const klineList = rawKlineList.slice(-KLINE_BUFFER_SIZE);
 
       logger.info({ symbol, klineCount: klineList.length }, `[MarketData] ${symbol} ensureSymbolLoaded fetchKlines response klineCount=${klineList.length} [${this.interval}]`);
@@ -302,6 +308,7 @@ class MarketDataManager extends EventEmitter implements FeederSource {
   }
 
   async shutdown(): Promise<void> {
+    this.isShutDown = true;
     const exchangeClient = this.exchangeConnector.futures;
 
     if (this.stalenessSchedulerHandle !== null) {
@@ -406,6 +413,10 @@ class MarketDataManager extends EventEmitter implements FeederSource {
   }
 
   private handleKline(symbol: string, kline: Kline): void {
+    if (this.isShutDown) {
+      return;
+    }
+
     this.recordInboundMessage();
 
     try {

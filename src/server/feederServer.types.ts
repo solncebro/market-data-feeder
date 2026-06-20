@@ -17,6 +17,8 @@ interface FeederServerArgs {
   logger: FeederLogger;
   snapshotChunkSize?: number;
   onHealthEvent?: (event: HealthEvent) => void;
+  maxConnections?: number;
+  maxPayloadBytes?: number;
 }
 
 interface ForwardFeedMessageArgs {

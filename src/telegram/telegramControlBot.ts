@@ -63,6 +63,10 @@ function resolveSymbolInput(rawText: string): string | null {
 function createTelegramControlBot(args: TelegramControlBotArgs): TelegramControlBot {
   const { allowedChatIdList, botToken, exchangeName, logger, onReboot, statusProvider } = args;
 
+  if (allowedChatIdList.length === 0) {
+    throw new Error('Telegram allowedChatIdList is empty — refusing to start a bot that would accept every chat (fail-closed)');
+  }
+
   const encoder = createCallbackEncoder<CallbackData>([
     { key: 'step', shortCode: 's', encode: String, decode: (value) => String(value) as MenuStep },
     { key: 'interval', shortCode: 'i', encode: String, decode: (value) => String(value) as KlineInterval },

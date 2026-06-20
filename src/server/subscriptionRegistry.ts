@@ -189,6 +189,8 @@ class SubscriptionRegistry<TSource extends ManagedSource> {
         throw error;
       }
 
+      this.undoOrphanIfReleased(registration, symbol);
+
       return;
     }
 
@@ -207,6 +209,16 @@ class SubscriptionRegistry<TSource extends ManagedSource> {
       throw error;
     } finally {
       registration.symbolLoadPromiseBySymbol.delete(symbol);
+    }
+
+    this.undoOrphanIfReleased(registration, symbol);
+  }
+
+  private undoOrphanIfReleased(registration: IntervalRegistration<TSource>, symbol: string): void {
+    const refCount = registration.symbolRefCountBySymbol.get(symbol) ?? 0;
+
+    if (refCount === 0 && registration.allSubscriberCount === 0 && !registration.isAllLoaded) {
+      registration.source.releaseSymbol(symbol);
     }
   }
 

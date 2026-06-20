@@ -373,6 +373,43 @@ describe('feeder channel', () => {
     }
   });
 
+  it('rejects connections beyond the configured limit', async () => {
+    const source = new FakeFeederSource('30m', new Map([['BTCUSDT', [makeKline(1000)]]]));
+    const server = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => source, maxConnections: 1 });
+    await server.start();
+
+    const firstSocket = new WebSocket(`ws://127.0.0.1:${server.getPort()}`);
+    const secondSocket = new WebSocket(`ws://127.0.0.1:${server.getPort()}`);
+
+    try {
+      await new Promise<void>((resolve) => firstSocket.on('open', () => resolve()));
+      await waitFor(() => server.getStatus().clientCount === 1);
+
+      const secondClosed = new Promise<void>((resolve) => secondSocket.on('close', () => resolve()));
+      await secondClosed;
+
+      expect(server.getStatus().clientCount).toBe(1);
+    } finally {
+      firstSocket.close();
+      secondSocket.close();
+      await server.shutdown();
+    }
+  });
+
+  it('rejects start() when the port is already bound', async () => {
+    const first = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => new FakeFeederSource('30m', new Map()) });
+    await first.start();
+
+    const second = new FeederServer({ port: first.getPort(), logger: NOOP_FEEDER_LOGGER, createSource: () => new FakeFeederSource('30m', new Map()) });
+
+    try {
+      await expect(second.start()).rejects.toThrow();
+    } finally {
+      await second.shutdown();
+      await first.shutdown();
+    }
+  });
+
   it('does not forward events a client did not subscribe to', async () => {
     const source = new FakeFeederSource('30m', new Map([['BTCUSDT', [makeKline(1000)]]]));
     const server = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => source });

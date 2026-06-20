@@ -6,6 +6,7 @@ dist/
 !.env.binance.example
 !.env.bybit.example
 firebase-sa.json
+feeder-restart-log.json
 *.log
 .DS_Store
 logs/
