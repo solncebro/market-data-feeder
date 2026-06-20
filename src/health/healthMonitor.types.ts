@@ -23,6 +23,7 @@ interface HealthMonitorConfig {
   alertDedupMs: number;
   recoveryGraceMs: number;
   batchFlushMs: number;
+  digestIntervalMs: number;
 }
 
 interface HealthMonitorArgs {

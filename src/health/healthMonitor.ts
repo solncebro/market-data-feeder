@@ -11,6 +11,12 @@ function isCriticalTransportMessage(message: string): boolean {
   return CRITICAL_TRANSPORT_MARKER_LIST.some((marker) => lower.includes(marker));
 }
 
+function isWatchdogSummaryMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+
+  return lower.includes('kline') && (lower.includes('overdue') || lower.includes('recover'));
+}
+
 function formatSeconds(ms: number): number {
   return Math.round(ms / 1000);
 }
@@ -52,15 +58,12 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
   const inFlightSendSet = new Set<Promise<void>>();
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const pendingStalledByKey = new Map<string, SymbolEntry>();
-  const pendingRecoveredByKey = new Map<string, SymbolEntry>();
   const pendingRecoveryFailedByKey = new Map<string, SymbolEntry>();
-  const pendingStuckByKey = new Map<string, SymbolEntry>();
-  const pendingUnstuckByKey = new Map<string, SymbolEntry>();
-  const pendingLoadedByKey = new Map<string, SymbolEntry>();
-  const pendingLoadFailedByKey = new Map<string, SymbolEntry>();
-  const activeStallKeySet = new Set<string>();
   let batchTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const windowDegradedKeySet = new Set<string>();
+  const windowRecoveredKeySet = new Set<string>();
+  const unrecoveredByKey = new Map<string, SymbolEntry>();
 
   const emitAlert = (message: string): void => {
     const sendPromise = Promise.resolve(sendAlert(escapeMarkdownV2WithFormatting(message))).catch((error: unknown) => {
@@ -115,20 +118,7 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
 
   const flushBatch = (): void => {
     batchTimer = null;
-
-    if (pendingStalledByKey.size > 0) {
-      for (const key of pendingStalledByKey.keys()) {
-        activeStallKeySet.add(key);
-      }
-    }
-
-    flushPending(pendingStalledByKey, '⚠️ Streams stalled');
-    flushPending(pendingRecoveredByKey, '✅ Streams recovered');
     flushPending(pendingRecoveryFailedByKey, '🛑 Stream recovery failed');
-    flushPending(pendingStuckByKey, '⚠️ Symbols stuck (no fresh candles)');
-    flushPending(pendingUnstuckByKey, '✅ Symbols producing fresh candles again');
-    flushPending(pendingLoadedByKey, '📥 Loaded on demand');
-    flushPending(pendingLoadFailedByKey, '⚠️ Symbols failed to load');
   };
 
   const scheduleBatchFlush = (): void => {
@@ -139,64 +129,27 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
     batchTimer = setTimeout(flushBatch, config.batchFlushMs);
   };
 
-  const noteStreamStalled = (interval: string, symbol: string, ageMs: number | undefined): void => {
-    const key = `${interval}:${symbol}`;
+  const emitDigest = (): void => {
+    if (windowDegradedKeySet.size === 0 && windowRecoveredKeySet.size === 0 && unrecoveredByKey.size === 0) {
+      emitAlert('✅ Kline streams healthy — no issues since the last report.');
 
-    if (activeStallKeySet.has(key)) {
       return;
     }
 
-    pendingStalledByKey.set(key, { interval, symbol, ageMs });
-    pendingRecoveredByKey.delete(key);
-    scheduleBatchFlush();
-  };
+    const lineList = [`📋 Kline streams report: ${windowDegradedKeySet.size} degraded, ${windowRecoveredKeySet.size} recovered.`];
 
-  const noteStreamRecovered = (interval: string, symbol: string): void => {
-    const key = `${interval}:${symbol}`;
-    const wasPending = pendingStalledByKey.delete(key);
-    const wasActive = activeStallKeySet.delete(key);
-
-    if (wasPending && !wasActive) {
-      return;
+    if (unrecoveredByKey.size > 0) {
+      lineList.push('');
+      lineList.push(buildGroupedSymbolMessage(`🛑 Still unrecovered (${unrecoveredByKey.size}):`, Array.from(unrecoveredByKey.values())));
     }
 
-    pendingRecoveredByKey.set(key, { interval, symbol });
-    scheduleBatchFlush();
+    emitAlert(lineList.join('\n'));
+    windowDegradedKeySet.clear();
+    windowRecoveredKeySet.clear();
   };
 
-  const noteStreamRecoveryFailed = (interval: string, symbol: string): void => {
-    const key = `${interval}:${symbol}`;
-    pendingStalledByKey.delete(key);
-    activeStallKeySet.delete(key);
-    pendingRecoveryFailedByKey.set(key, { interval, symbol });
-    scheduleBatchFlush();
-  };
-
-  const noteSymbolStuck = (interval: string, symbol: string): void => {
-    pendingStuckByKey.set(`${interval}:${symbol}`, { interval, symbol });
-    scheduleBatchFlush();
-  };
-
-  const noteSymbolUnstuck = (interval: string, symbol: string): void => {
-    const key = `${interval}:${symbol}`;
-
-    if (pendingStuckByKey.delete(key)) {
-      return;
-    }
-
-    pendingUnstuckByKey.set(key, { interval, symbol });
-    scheduleBatchFlush();
-  };
-
-  const noteSymbolLoaded = (interval: string, symbol: string): void => {
-    pendingLoadedByKey.set(`${interval}:${symbol}`, { interval, symbol });
-    scheduleBatchFlush();
-  };
-
-  const noteSymbolLoadFailed = (interval: string, symbol: string): void => {
-    pendingLoadFailedByKey.set(`${interval}:${symbol}`, { interval, symbol });
-    scheduleBatchFlush();
-  };
+  const digestTimer = setInterval(emitDigest, config.digestIntervalMs);
+  digestTimer.unref();
 
   const runEscalation = (): void => {
     restartTimer = null;
@@ -265,20 +218,28 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
 
         return;
 
-      case 'klineStreamRecoveryFailed':
-        noteStreamRecoveryFailed(event.interval, event.symbol);
-
-        return;
-
       case 'klineStreamStale':
-        noteStreamStalled(event.interval, event.symbol, event.ageMs);
+        windowDegradedKeySet.add(`${event.interval}:${event.symbol}`);
 
         return;
 
-      case 'klineStreamRecovered':
-        noteStreamRecovered(event.interval, event.symbol);
+      case 'klineStreamRecovered': {
+        const key = `${event.interval}:${event.symbol}`;
+        windowRecoveredKeySet.add(key);
+        unrecoveredByKey.delete(key);
 
         return;
+      }
+
+      case 'klineStreamRecoveryFailed': {
+        const key = `${event.interval}:${event.symbol}`;
+        windowDegradedKeySet.add(key);
+        unrecoveredByKey.set(key, { interval: event.interval, symbol: event.symbol });
+        pendingRecoveryFailedByKey.set(key, { interval: event.interval, symbol: event.symbol });
+        scheduleBatchFlush();
+
+        return;
+      }
 
       case 'transportNotify': {
         const safeMessage = event.message.replace(/[`*_~|]/g, '');
@@ -290,20 +251,27 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
           return;
         }
 
+        if (isWatchdogSummaryMessage(safeMessage)) {
+          return;
+        }
+
         alertWithDedup('transportNotify', `⚠️ Exchange transport: ${safeMessage}`);
 
         return;
       }
 
       case 'persistentStaleSymbol':
-        noteSymbolStuck(event.interval, event.symbol);
+        windowDegradedKeySet.add(`${event.interval}:${event.symbol}`);
 
         return;
 
-      case 'persistentStaleRecovered':
-        noteSymbolUnstuck(event.interval, event.symbol);
+      case 'persistentStaleRecovered': {
+        const key = `${event.interval}:${event.symbol}`;
+        windowRecoveredKeySet.add(key);
+        unrecoveredByKey.delete(key);
 
         return;
+      }
 
       case 'feederReady':
         emitAlert(`✅ ${event.exchangeName.toUpperCase()} feeder is up and serving on ${event.host}:${event.port}. Ready to accept clients.`);
@@ -321,12 +289,10 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
         return;
 
       case 'symbolLoadCompleted':
-        noteSymbolLoaded(event.interval, event.symbol);
-
         return;
 
       case 'symbolLoadFailed':
-        noteSymbolLoadFailed(event.interval, event.symbol);
+        windowDegradedKeySet.add(`${event.interval}:${event.symbol}`);
 
         return;
 
@@ -337,6 +303,7 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
 
   const shutdown = async (): Promise<void> => {
     cancelRestartTimer();
+    clearInterval(digestTimer);
 
     if (batchTimer !== null) {
       clearTimeout(batchTimer);

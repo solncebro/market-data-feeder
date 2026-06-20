@@ -4,7 +4,7 @@ import type { RestartGuard } from '../../health/restartGuard.js';
 import type { HealthMonitorConfig } from '../../health/healthMonitor.types.js';
 import { createHealthMonitor } from '../../health/healthMonitor.js';
 
-const SILENT_CONFIG: HealthMonitorConfig = { alertDedupMs: 300_000, recoveryGraceMs: 90_000, batchFlushMs: 3000 };
+const SILENT_CONFIG: HealthMonitorConfig = { alertDedupMs: 300_000, recoveryGraceMs: 90_000, batchFlushMs: 3000, digestIntervalMs: 1_800_000 };
 
 const noopLogger = { info: () => undefined, warn: () => undefined, error: () => undefined };
 
@@ -41,36 +41,6 @@ afterEach(() => {
 });
 
 describe('createHealthMonitor', () => {
-  it('alerts on a light event without ever escalating to a restart', async () => {
-    const { monitor, sendAlert, onRestart } = makeMonitor();
-
-    monitor.report({ kind: 'persistentStaleSymbol', interval: '30m', symbol: 'FOOUSDT' });
-    await vi.advanceTimersByTimeAsync(3000);
-
-    expect(sendAlert).toHaveBeenCalledTimes(1);
-
-    await vi.advanceTimersByTimeAsync(600_000);
-
-    expect(onRestart).not.toHaveBeenCalled();
-  });
-
-  it('batches a burst of stuck symbols into a single alert', async () => {
-    const { monitor, sendAlert, alertList } = makeMonitor();
-
-    monitor.report({ kind: 'persistentStaleSymbol', interval: '30m', symbol: 'FOOUSDT' });
-    monitor.report({ kind: 'persistentStaleSymbol', interval: '30m', symbol: 'FOOUSDT' });
-    monitor.report({ kind: 'persistentStaleSymbol', interval: '30m', symbol: 'BARUSDT' });
-
-    expect(sendAlert).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(3000);
-
-    expect(sendAlert).toHaveBeenCalledTimes(1);
-    expect(alertList[0]).toContain('FOOUSDT');
-    expect(alertList[0]).toContain('BARUSDT');
-    expect(alertList[0].toLowerCase()).toContain('stuck');
-  });
-
   it('escalates a silent stream to a restart after the recovery grace window', async () => {
     const { monitor, sendAlert, onRestart, restartGuard } = makeMonitor();
 
@@ -124,137 +94,92 @@ describe('createHealthMonitor', () => {
     expect(benign.sendAlert).toHaveBeenCalled();
   });
 
-  it('does not escalate a per-symbol watchdog scan summary that merely mentions failed symbols', async () => {
-    const { monitor, onRestart, sendAlert } = makeMonitor();
+  it('drops the kline-watchdog overdue/recovery transport summaries (covered by the digest)', async () => {
+    const { monitor, sendAlert, onRestart } = makeMonitor();
 
-    monitor.report({ kind: 'transportNotify', message: 'Stream scan: Recovered 3, Failed 2 symbols' });
+    monitor.report({ kind: 'transportNotify', message: 'Bybit Futures — Kline subscriptions overdue (10 total)' });
+    monitor.report({ kind: 'transportNotify', message: 'Bybit Futures — Kline recovery complete (10 symbols)' });
     await vi.advanceTimersByTimeAsync(120_000);
 
+    expect(sendAlert).not.toHaveBeenCalled();
     expect(onRestart).not.toHaveBeenCalled();
-    expect(sendAlert).toHaveBeenCalled();
   });
 
-  it('batches a burst of recovery-failed streams into one alert without restarting the whole process', async () => {
-    const { monitor, onRestart, alertList } = makeMonitor();
+  it('keeps per-symbol stall/recovery signals silent (they feed the digest, not immediate alerts)', async () => {
+    const { monitor, sendAlert } = makeMonitor();
+
+    monitor.report({ kind: 'klineStreamStale', interval: '5m', symbol: 'AAAUSDT', ageMs: 70_000 });
+    monitor.report({ kind: 'klineStreamRecovered', interval: '5m', symbol: 'AAAUSDT' });
+    monitor.report({ kind: 'persistentStaleSymbol', interval: '30m', symbol: 'BBBUSDT' });
+    monitor.report({ kind: 'persistentStaleRecovered', interval: '30m', symbol: 'BBBUSDT' });
+    monitor.report({ kind: 'symbolLoadCompleted', interval: '5m', symbol: 'CCCUSDT' });
+    monitor.report({ kind: 'symbolLoadFailed', interval: '5m', symbol: 'DDDUSDT' });
+
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(sendAlert).not.toHaveBeenCalled();
+  });
+
+  it('still alerts immediately when a stream fails to recover, batching a burst into one message', async () => {
+    const { monitor, sendAlert, onRestart, alertList } = makeMonitor();
 
     monitor.report({ kind: 'klineStreamRecoveryFailed', interval: '5m', symbol: 'AAAUSDT', consecutiveFailCount: 3 });
     monitor.report({ kind: 'klineStreamRecoveryFailed', interval: '5m', symbol: 'BBBUSDT', consecutiveFailCount: 3 });
 
-    await vi.advanceTimersByTimeAsync(3000);
-
-    const failedAlert = alertList.find((message) => message.toLowerCase().includes('recovery failed'));
-    expect(failedAlert).toBeDefined();
-    expect(failedAlert).toContain('AAAUSDT');
-    expect(failedAlert).toContain('BBBUSDT');
-
-    await vi.advanceTimersByTimeAsync(120_000);
-    expect(onRestart).not.toHaveBeenCalled();
-  });
-
-  it('sends a single unstuck alert once stuck symbols produce fresh candles again', async () => {
-    const { monitor, sendAlert, alertList } = makeMonitor();
-
-    monitor.report({ kind: 'persistentStaleSymbol', interval: '30m', symbol: 'FOOUSDT' });
-    await vi.advanceTimersByTimeAsync(3000);
-
-    monitor.report({ kind: 'persistentStaleRecovered', interval: '30m', symbol: 'FOOUSDT' });
-    await vi.advanceTimersByTimeAsync(3000);
-
-    expect(sendAlert).toHaveBeenCalledTimes(2);
-    expect(alertList[1]).toContain('FOOUSDT');
-    expect(alertList[1].toLowerCase()).toContain('fresh candles again');
-  });
-
-  it('batches many stalled stream events into a single alert', async () => {
-    const { monitor, sendAlert, alertList } = makeMonitor();
-
-    monitor.report({ kind: 'klineStreamStale', interval: '5m', symbol: 'AAAUSDT', ageMs: 69_000 });
-    monitor.report({ kind: 'klineStreamStale', interval: '5m', symbol: 'BBBUSDT', ageMs: 70_000 });
-
     expect(sendAlert).not.toHaveBeenCalled();
-
     await vi.advanceTimersByTimeAsync(3000);
 
     expect(sendAlert).toHaveBeenCalledTimes(1);
     expect(alertList[0]).toContain('AAAUSDT');
     expect(alertList[0]).toContain('BBBUSDT');
+    expect(alertList[0].toLowerCase()).toContain('recovery failed');
+
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(onRestart).not.toHaveBeenCalled();
   });
 
-  it('sends a single recovered alert once stalled streams come back', async () => {
-    const { monitor, sendAlert, alertList } = makeMonitor();
+  it('sends a digest summarizing degraded and recovered streams after the digest interval', async () => {
+    const { monitor, sendAlert, alertList } = makeMonitor({ digestIntervalMs: 5000 });
 
-    monitor.report({ kind: 'klineStreamStale', interval: '5m', symbol: 'AAAUSDT', ageMs: 69_000 });
-    monitor.report({ kind: 'klineStreamStale', interval: '5m', symbol: 'BBBUSDT', ageMs: 70_000 });
-    await vi.advanceTimersByTimeAsync(3000);
-
+    monitor.report({ kind: 'klineStreamStale', interval: '5m', symbol: 'AAAUSDT', ageMs: 70_000 });
+    monitor.report({ kind: 'persistentStaleSymbol', interval: '30m', symbol: 'BBBUSDT' });
     monitor.report({ kind: 'klineStreamRecovered', interval: '5m', symbol: 'AAAUSDT' });
-    monitor.report({ kind: 'klineStreamRecovered', interval: '5m', symbol: 'BBBUSDT' });
-    await vi.advanceTimersByTimeAsync(3000);
-
-    expect(sendAlert).toHaveBeenCalledTimes(2);
-    expect(alertList[1].toLowerCase()).toContain('recovered');
-    expect(alertList[1]).toContain('AAAUSDT');
-  });
-
-  it('stays silent when a stalled stream recovers before the batch flush', async () => {
-    const { monitor, sendAlert } = makeMonitor();
-
-    monitor.report({ kind: 'klineStreamStale', interval: '5m', symbol: 'AAAUSDT', ageMs: 69_000 });
-    monitor.report({ kind: 'klineStreamRecovered', interval: '5m', symbol: 'AAAUSDT' });
-
-    await vi.advanceTimersByTimeAsync(3000);
 
     expect(sendAlert).not.toHaveBeenCalled();
-  });
 
-  it('sends a recovered alert even when the stall was never reported per symbol', async () => {
-    const { monitor, sendAlert, alertList } = makeMonitor();
-
-    monitor.report({ kind: 'klineStreamRecovered', interval: '5m', symbol: 'ZZZUSDT' });
-    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(5000);
 
     expect(sendAlert).toHaveBeenCalledTimes(1);
+    expect(alertList[0].toLowerCase()).toContain('degraded');
     expect(alertList[0].toLowerCase()).toContain('recovered');
-    expect(alertList[0]).toContain('ZZZUSDT');
+    expect(alertList[0]).toContain('2');
+    expect(alertList[0]).toContain('1');
   });
 
-  it('drains in-flight alert sends before shutdown resolves', async () => {
-    let resolveSend: (() => void) | null = null;
-    const sendAlert = vi.fn(() => new Promise<void>((resolve) => {
-      resolveSend = resolve;
-    }));
-    const monitor = createHealthMonitor({ config: SILENT_CONFIG, sendAlert, restartGuard: makeGuard(true), onRestart: vi.fn(), logger: noopLogger });
+  it('lists streams that failed to recover in the digest until they recover', async () => {
+    const { monitor, alertList } = makeMonitor({ digestIntervalMs: 5000 });
 
-    monitor.report({ kind: 'feederReady', exchangeName: 'bybit', host: '127.0.0.1', port: 7070 });
+    monitor.report({ kind: 'klineStreamRecoveryFailed', interval: '5m', symbol: 'ZZZUSDT', consecutiveFailCount: 3 });
+    await vi.advanceTimersByTimeAsync(5000);
 
-    let isDone = false;
-    const shutdownPromise = monitor.shutdown().then(() => {
-      isDone = true;
-    });
-    await Promise.resolve();
-    await Promise.resolve();
+    const digest = alertList.find((message) => message.toLowerCase().includes('unrecovered'));
+    expect(digest).toBeDefined();
+    expect(digest).toContain('ZZZUSDT');
 
-    expect(isDone).toBe(false);
+    monitor.report({ kind: 'klineStreamRecovered', interval: '5m', symbol: 'ZZZUSDT' });
+    await vi.advanceTimersByTimeAsync(5000);
 
-    resolveSend?.();
-    await shutdownPromise;
-
-    expect(isDone).toBe(true);
+    const lastDigest = alertList[alertList.length - 1];
+    expect(lastDigest).not.toContain('ZZZUSDT');
   });
 
-  it('does not hang shutdown when an alert send never settles', async () => {
-    const sendAlert = vi.fn(() => new Promise<void>(() => undefined));
-    const monitor = createHealthMonitor({ config: SILENT_CONFIG, sendAlert, restartGuard: makeGuard(true), onRestart: vi.fn(), logger: noopLogger });
+  it('reports all-healthy in the digest on a clean window', async () => {
+    const { monitor, sendAlert, alertList } = makeMonitor({ digestIntervalMs: 5000 });
 
-    monitor.report({ kind: 'feederReady', exchangeName: 'bybit', host: '127.0.0.1', port: 7070 });
+    await vi.advanceTimersByTimeAsync(5000);
 
-    let isDone = false;
-    monitor.shutdown().then(() => {
-      isDone = true;
-    });
-    await vi.advanceTimersByTimeAsync(2500);
-
-    expect(isDone).toBe(true);
+    expect(sendAlert).toHaveBeenCalledTimes(1);
+    expect(alertList[0].toLowerCase()).toContain('healthy');
   });
 
   it('announces feeder readiness immediately', () => {
@@ -307,37 +232,42 @@ describe('createHealthMonitor', () => {
     expect(alertList.some((message) => message.toLowerCase().includes('cleared'))).toBe(true);
   });
 
-  it('batches a burst of failed symbol loads into a single alert without restarting', async () => {
-    const { monitor, sendAlert, onRestart, alertList } = makeMonitor();
+  it('drains in-flight alert sends before shutdown resolves', async () => {
+    let resolveSend: (() => void) | null = null;
+    const sendAlert = vi.fn(() => new Promise<void>((resolve) => {
+      resolveSend = resolve;
+    }));
+    const monitor = createHealthMonitor({ config: SILENT_CONFIG, sendAlert, restartGuard: makeGuard(true), onRestart: vi.fn(), logger: noopLogger });
 
-    monitor.report({ kind: 'symbolLoadFailed', interval: '30m', symbol: 'AAAUSDT' });
-    monitor.report({ kind: 'symbolLoadFailed', interval: '30m', symbol: 'BBBUSDT' });
+    monitor.report({ kind: 'feederReady', exchangeName: 'bybit', host: '127.0.0.1', port: 7070 });
 
-    expect(sendAlert).not.toHaveBeenCalled();
+    let isDone = false;
+    const shutdownPromise = monitor.shutdown().then(() => {
+      isDone = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
 
-    await vi.advanceTimersByTimeAsync(3000);
+    expect(isDone).toBe(false);
 
-    expect(sendAlert).toHaveBeenCalledTimes(1);
-    expect(alertList[0]).toContain('AAAUSDT');
-    expect(alertList[0]).toContain('BBBUSDT');
-    expect(alertList[0].toLowerCase()).toContain('failed to load');
+    resolveSend?.();
+    await shutdownPromise;
 
-    await vi.advanceTimersByTimeAsync(120_000);
-
-    expect(onRestart).not.toHaveBeenCalled();
+    expect(isDone).toBe(true);
   });
 
-  it('batches on-demand symbol loads into a single alert', async () => {
-    const { monitor, sendAlert, alertList } = makeMonitor();
+  it('does not hang shutdown when an alert send never settles', async () => {
+    const sendAlert = vi.fn(() => new Promise<void>(() => undefined));
+    const monitor = createHealthMonitor({ config: SILENT_CONFIG, sendAlert, restartGuard: makeGuard(true), onRestart: vi.fn(), logger: noopLogger });
 
-    monitor.report({ kind: 'symbolLoadCompleted', interval: '5m', symbol: 'NEWAUSDT' });
-    monitor.report({ kind: 'symbolLoadCompleted', interval: '5m', symbol: 'NEWBUSDT' });
+    monitor.report({ kind: 'feederReady', exchangeName: 'bybit', host: '127.0.0.1', port: 7070 });
 
-    expect(sendAlert).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(3000);
+    let isDone = false;
+    monitor.shutdown().then(() => {
+      isDone = true;
+    });
+    await vi.advanceTimersByTimeAsync(2500);
 
-    expect(sendAlert).toHaveBeenCalledTimes(1);
-    expect(alertList[0]).toContain('NEWAUSDT');
-    expect(alertList[0]).toContain('NEWBUSDT');
+    expect(isDone).toBe(true);
   });
 });

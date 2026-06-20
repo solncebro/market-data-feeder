@@ -59,6 +59,7 @@ class MarketDataManager extends EventEmitter implements FeederSource {
   private readonly persistentStaleEmittedSet: Set<string> = new Set();
   private readonly skippedOlderKlineCountBySymbol: Map<string, number> = new Map();
   private throttledMaRecomputeCount: number = 0;
+  private skippedStaleEmitCount: number = 0;
   private lastInboundAtMs: number = 0;
   private isStreamSilent: boolean = false;
   private isMassStale: boolean = false;
@@ -551,11 +552,7 @@ class MarketDataManager extends EventEmitter implements FeederSource {
 
   private emitGuarded(eventName: 'klineClosed' | 'klineUpdated', symbol: string, kline: Kline, maValues: MaValues): void {
     if (!this.isKlineFresh(kline)) {
-      const intervalMs = resolveIntervalMs(this.interval);
-      const klineEndMs = kline.openTimestamp + intervalMs;
-      const klineAgeMs = Date.now() - klineEndMs;
-      const thresholdMs = STALENESS_THRESHOLD_MULTIPLIER * intervalMs;
-      logger.info({ symbol, eventName, klineAgeMs, thresholdMs, openTimestamp: kline.openTimestamp }, `[MarketData] ${symbol} Skipped emit ${eventName} for stale kline (age=${Math.round(klineAgeMs / 60_000)}m, threshold=${Math.round(thresholdMs / 60_000)}m) [${this.interval}]`);
+      this.skippedStaleEmitCount += 1;
 
       return;
     }
@@ -574,7 +571,9 @@ class MarketDataManager extends EventEmitter implements FeederSource {
         const persistentStaleCount = this.consecutiveStaleScanCountBySymbol.size;
         const throttledMaRecomputeCount = this.throttledMaRecomputeCount;
         this.throttledMaRecomputeCount = 0;
-        logger.info({ tickCount, symbolCount, persistentStaleCount, throttledMaRecomputeCount }, `[MarketData] Staleness watchdog alive — tick #${tickCount}, ${symbolCount} symbols monitored, ${persistentStaleCount} persistent stale, ${throttledMaRecomputeCount} MA recomputes throttled in last period [${this.interval}]`);
+        const skippedStaleEmitCount = this.skippedStaleEmitCount;
+        this.skippedStaleEmitCount = 0;
+        logger.info({ tickCount, symbolCount, persistentStaleCount, throttledMaRecomputeCount, skippedStaleEmitCount }, `[MarketData] Staleness watchdog alive — tick #${tickCount}, ${symbolCount} symbols monitored, ${persistentStaleCount} persistent stale, ${throttledMaRecomputeCount} MA recomputes throttled, ${skippedStaleEmitCount} stale emits skipped in last period [${this.interval}]`);
         this.flushSkippedOlderKlineCounters();
       },
     });

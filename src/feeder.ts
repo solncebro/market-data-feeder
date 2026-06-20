@@ -15,10 +15,13 @@ import { createTelegramControlBot } from './telegram/telegramControlBot.js';
 const HEALTH_ALERT_DEDUP_MS = 300_000;
 const HEALTH_RECOVERY_GRACE_MS = 120_000;
 const HEALTH_BATCH_FLUSH_MS = 3000;
+const HEALTH_DIGEST_INTERVAL_MS = 30 * 60_000;
 const RESTART_WINDOW_MS = 30 * 60_000;
 const MAX_AUTO_RESTARTS = 3;
 const CRASH_ALERT_GRACE_MS = 3000;
 const SHUTDOWN_HARD_EXIT_MS = 15_000;
+const KLINE_WATCHDOG_GRACE_MS = 180_000;
+const KLINE_WATCHDOG_RECOVERY_COOLDOWN_MS = 300_000;
 // On-disk log of auto-restart moments — survives a process restart so the loop guard
 // (at most MAX_AUTO_RESTARTS within RESTART_WINDOW_MS) keeps working across restarts.
 const RESTART_STATE_FILE = './feeder-restart-log.json';
@@ -79,6 +82,7 @@ async function main(): Promise<void> {
       alertDedupMs: HEALTH_ALERT_DEDUP_MS,
       recoveryGraceMs: HEALTH_RECOVERY_GRACE_MS,
       batchFlushMs: HEALTH_BATCH_FLUSH_MS,
+      digestIntervalMs: HEALTH_DIGEST_INTERVAL_MS,
     },
     sendAlert: (message) => sendAlert(message),
     restartGuard,
@@ -97,6 +101,8 @@ async function main(): Promise<void> {
     (message: string) => healthMonitor.report({ kind: 'transportNotify', message }),
     undefined,
     {
+      graceMs: KLINE_WATCHDOG_GRACE_MS,
+      recoveryCooldownMs: KLINE_WATCHDOG_RECOVERY_COOLDOWN_MS,
       onStreamStale: (event) => healthMonitor.report({ kind: 'klineStreamStale', interval: event.interval as KlineInterval, symbol: event.symbol, ageMs: event.ageMs }),
       onStreamRecovered: (event) => healthMonitor.report({ kind: 'klineStreamRecovered', interval: event.interval as KlineInterval, symbol: event.symbol }),
       onStreamRecoveryFailed: (event) => healthMonitor.report({ kind: 'klineStreamRecoveryFailed', interval: event.interval as KlineInterval, symbol: event.symbol, consecutiveFailCount: event.consecutiveFailCount }),
