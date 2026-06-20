@@ -5,6 +5,7 @@ import type { FeedEventName, SubscriptionScope } from '../domain/subscription.ty
 import type { MarketDataSnapshotEntry } from '../domain/snapshot.types.js';
 import type { ServerMessage, SnapshotMessage, SubscribeMessage, SymbolAddedMessage, SymbolRemovedMessage, UnsubscribeMessage, Volume24hMessage } from '../protocol/messages.types.js';
 import { decodeMessage, encodeMessage } from '../protocol/codec.js';
+import { isValidSubscribe } from '../protocol/clientMessageValidation.js';
 import { SubscriptionRegistry } from './subscriptionRegistry.js';
 import type { HealthEvent } from '../health/healthMonitor.types.js';
 import type { FeederSource } from './feederSource.types.js';
@@ -268,6 +269,10 @@ class FeederServer {
       this.emitHealthEvent({ kind: 'symbolLoadCompleted', interval, symbol });
     });
 
+    source.on('symbolLoadFailed', (symbol) => {
+      this.emitHealthEvent({ kind: 'symbolLoadFailed', interval, symbol });
+    });
+
     return source;
   }
 
@@ -310,6 +315,12 @@ class FeederServer {
     }
 
     if (message.type === 'subscribe') {
+      if (!isValidSubscribe(message)) {
+        this.logger.warn({ interval: message.interval }, '[Feeder] dropped invalid subscribe message');
+
+        return;
+      }
+
       this.handleSubscribe(client, message).catch((error: unknown) => {
         this.logger.error({ error, interval: message.interval }, '[Feeder] handleSubscribe failed');
       });
@@ -325,8 +336,15 @@ class FeederServer {
   }
 
   private async handleSubscribe(client: ClientConnection, message: SubscribeMessage): Promise<void> {
+    const previousSubscription = client.subscriptionByInterval.get(message.interval);
     const subscription: ClientSubscription = { scope: message.scope, eventNameSet: new Set(message.events) };
     client.subscriptionByInterval.set(message.interval, subscription);
+
+    if (previousSubscription !== undefined) {
+      this.registry.unsubscribe({ interval: message.interval, scope: previousSubscription.scope }).catch((error: unknown) => {
+        this.logger.error({ error, interval: message.interval }, '[Feeder] failed to release superseded subscription');
+      });
+    }
 
     let source: FeederSource;
 

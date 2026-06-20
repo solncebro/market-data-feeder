@@ -25,14 +25,14 @@ interface FeederSource extends ManagedSource {
   getPersistentStaleCount: () => number;
   on(eventName: 'klineClosed' | 'klineUpdated', listener: KlineWithMaListener): this;
   on(eventName: 'klineUpdatedTick', listener: KlineTickListener): this;
-  on(eventName: 'symbolAdded' | 'symbolRemoved' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted', listener: SymbolNameListener): this;
+  on(eventName: 'symbolAdded' | 'symbolRemoved' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted' | 'symbolLoadFailed', listener: SymbolNameListener): this;
   on(eventName: 'volume24h', listener: Volume24hListener): this;
   on(eventName: 'streamSilent' | 'streamResumed', listener: StreamSilenceListener): this;
   on(eventName: 'sourceMassStale' | 'sourceMassStaleRecovered', listener: SourceMassStaleListener): this;
   on(eventName: 'intervalLoadStarted' | 'intervalLoadCompleted', listener: IntervalLoadListener): this;
   off(eventName: 'klineClosed' | 'klineUpdated', listener: KlineWithMaListener): this;
   off(eventName: 'klineUpdatedTick', listener: KlineTickListener): this;
-  off(eventName: 'symbolAdded' | 'symbolRemoved' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted', listener: SymbolNameListener): this;
+  off(eventName: 'symbolAdded' | 'symbolRemoved' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted' | 'symbolLoadFailed', listener: SymbolNameListener): this;
   off(eventName: 'volume24h', listener: Volume24hListener): this;
   off(eventName: 'streamSilent' | 'streamResumed', listener: StreamSilenceListener): this;
   off(eventName: 'sourceMassStale' | 'sourceMassStaleRecovered', listener: SourceMassStaleListener): this;

@@ -124,6 +124,16 @@ describe('createHealthMonitor', () => {
     expect(benign.sendAlert).toHaveBeenCalled();
   });
 
+  it('does not escalate a per-symbol watchdog scan summary that merely mentions failed symbols', async () => {
+    const { monitor, onRestart, sendAlert } = makeMonitor();
+
+    monitor.report({ kind: 'transportNotify', message: 'Stream scan: Recovered 3, Failed 2 symbols' });
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(onRestart).not.toHaveBeenCalled();
+    expect(sendAlert).toHaveBeenCalled();
+  });
+
   it('batches a burst of recovery-failed streams into one alert without restarting the whole process', async () => {
     const { monitor, onRestart, alertList } = makeMonitor();
 
@@ -208,6 +218,45 @@ describe('createHealthMonitor', () => {
     expect(alertList[0]).toContain('ZZZUSDT');
   });
 
+  it('drains in-flight alert sends before shutdown resolves', async () => {
+    let resolveSend: (() => void) | null = null;
+    const sendAlert = vi.fn(() => new Promise<void>((resolve) => {
+      resolveSend = resolve;
+    }));
+    const monitor = createHealthMonitor({ config: SILENT_CONFIG, sendAlert, restartGuard: makeGuard(true), onRestart: vi.fn(), logger: noopLogger });
+
+    monitor.report({ kind: 'feederReady', exchangeName: 'bybit', host: '127.0.0.1', port: 7070 });
+
+    let isDone = false;
+    const shutdownPromise = monitor.shutdown().then(() => {
+      isDone = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(isDone).toBe(false);
+
+    resolveSend?.();
+    await shutdownPromise;
+
+    expect(isDone).toBe(true);
+  });
+
+  it('does not hang shutdown when an alert send never settles', async () => {
+    const sendAlert = vi.fn(() => new Promise<void>(() => undefined));
+    const monitor = createHealthMonitor({ config: SILENT_CONFIG, sendAlert, restartGuard: makeGuard(true), onRestart: vi.fn(), logger: noopLogger });
+
+    monitor.report({ kind: 'feederReady', exchangeName: 'bybit', host: '127.0.0.1', port: 7070 });
+
+    let isDone = false;
+    monitor.shutdown().then(() => {
+      isDone = true;
+    });
+    await vi.advanceTimersByTimeAsync(2500);
+
+    expect(isDone).toBe(true);
+  });
+
   it('announces feeder readiness immediately', () => {
     const { monitor, sendAlert, alertList } = makeMonitor();
 
@@ -256,6 +305,26 @@ describe('createHealthMonitor', () => {
 
     expect(onRestart).not.toHaveBeenCalled();
     expect(alertList.some((message) => message.toLowerCase().includes('cleared'))).toBe(true);
+  });
+
+  it('batches a burst of failed symbol loads into a single alert without restarting', async () => {
+    const { monitor, sendAlert, onRestart, alertList } = makeMonitor();
+
+    monitor.report({ kind: 'symbolLoadFailed', interval: '30m', symbol: 'AAAUSDT' });
+    monitor.report({ kind: 'symbolLoadFailed', interval: '30m', symbol: 'BBBUSDT' });
+
+    expect(sendAlert).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(3000);
+
+    expect(sendAlert).toHaveBeenCalledTimes(1);
+    expect(alertList[0]).toContain('AAAUSDT');
+    expect(alertList[0]).toContain('BBBUSDT');
+    expect(alertList[0].toLowerCase()).toContain('failed to load');
+
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(onRestart).not.toHaveBeenCalled();
   });
 
   it('batches on-demand symbol loads into a single alert', async () => {

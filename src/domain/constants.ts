@@ -26,4 +26,8 @@ function resolveIntervalMs(interval: KlineInterval): number {
   return INTERVAL_MS_BY_KEY[interval] ?? DEFAULT_INTERVAL_MS;
 }
 
-export { KLINE_BUFFER_SIZE, STALENESS_THRESHOLD_MULTIPLIER, resolveIntervalMs };
+function isKnownInterval(value: string): value is KlineInterval {
+  return Object.prototype.hasOwnProperty.call(INTERVAL_MS_BY_KEY, value);
+}
+
+export { KLINE_BUFFER_SIZE, STALENESS_THRESHOLD_MULTIPLIER, isKnownInterval, resolveIntervalMs };

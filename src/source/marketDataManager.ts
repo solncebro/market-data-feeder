@@ -92,8 +92,15 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     await this.loadKlines(usdtSymbolList);
     this.subscribeToKlines(usdtSymbolList);
 
-    logger.info({ totalSymbols: usdtSymbolList.length }, `[MarketData] All klines loaded (${usdtSymbolList.length} symbols), subscriptions active [${this.interval}]`);
-    this.emit('intervalLoadCompleted', usdtSymbolList.length);
+    const loadedCount = this.klineListBySymbol.size;
+    const failedSymbolList = usdtSymbolList.filter((symbol) => !this.klineListBySymbol.has(symbol));
+
+    for (const symbol of failedSymbolList) {
+      this.emit('symbolLoadFailed', symbol);
+    }
+
+    logger.info({ loadedCount, requestedCount: usdtSymbolList.length, failedCount: failedSymbolList.length }, `[MarketData] All klines loaded (${loadedCount}/${usdtSymbolList.length} symbols), subscriptions active [${this.interval}]`);
+    this.emit('intervalLoadCompleted', loadedCount);
   }
 
   getInterval(): KlineInterval {
@@ -213,6 +220,7 @@ class MarketDataManager extends EventEmitter implements FeederSource {
 
       if (klineList.length === 0) {
         logger.warn({ symbol }, `[MarketData] ${symbol} ensureSymbolLoaded — empty kline list, skipping subscription [${this.interval}]`);
+        this.emit('symbolLoadFailed', symbol);
 
         return false;
       }
@@ -234,6 +242,7 @@ class MarketDataManager extends EventEmitter implements FeederSource {
       return true;
     } catch (error: unknown) {
       logger.error({ symbol, error }, `[MarketData] ${symbol} ensureSymbolLoaded failed [${this.interval}]`);
+      this.emit('symbolLoadFailed', symbol);
 
       return false;
     }

@@ -2,7 +2,8 @@ import { escapeMarkdownV2WithFormatting, formatClickableText } from '@solncebro/
 
 import type { HealthEvent, HealthMonitor, HealthMonitorArgs } from './healthMonitor.types.js';
 
-const CRITICAL_TRANSPORT_MARKER_LIST = ['critical', 'fatal', 'max retries', 'exceeded', 'failed'];
+const CRITICAL_TRANSPORT_MARKER_LIST = ['critical', 'fatal', 'max retries'];
+const ALERT_DRAIN_TIMEOUT_MS = 2500;
 
 function isCriticalTransportMessage(message: string): boolean {
   const lower = message.toLowerCase();
@@ -48,6 +49,7 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
 
   const lastAlertAtByKey = new Map<string, number>();
   const degradedReasonByKey = new Map<string, string>();
+  const inFlightSendSet = new Set<Promise<void>>();
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
 
   const pendingStalledByKey = new Map<string, SymbolEntry>();
@@ -56,13 +58,32 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
   const pendingStuckByKey = new Map<string, SymbolEntry>();
   const pendingUnstuckByKey = new Map<string, SymbolEntry>();
   const pendingLoadedByKey = new Map<string, SymbolEntry>();
+  const pendingLoadFailedByKey = new Map<string, SymbolEntry>();
   const activeStallKeySet = new Set<string>();
   let batchTimer: ReturnType<typeof setTimeout> | null = null;
 
   const emitAlert = (message: string): void => {
-    void Promise.resolve(sendAlert(escapeMarkdownV2WithFormatting(message))).catch((error: unknown) => {
+    const sendPromise = Promise.resolve(sendAlert(escapeMarkdownV2WithFormatting(message))).catch((error: unknown) => {
       logger.error({ error }, '[Health] failed to send alert');
     });
+
+    inFlightSendSet.add(sendPromise);
+    sendPromise.finally(() => {
+      inFlightSendSet.delete(sendPromise);
+    });
+  };
+
+  const drainPendingSends = async (): Promise<void> => {
+    if (inFlightSendSet.size === 0) {
+      return;
+    }
+
+    const settled = Promise.allSettled(Array.from(inFlightSendSet));
+    const timeout = new Promise<void>((resolve) => {
+      setTimeout(resolve, ALERT_DRAIN_TIMEOUT_MS).unref();
+    });
+
+    await Promise.race([settled, timeout]);
   };
 
   const alertWithDedup = (dedupKey: string, message: string): void => {
@@ -107,6 +128,7 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
     flushPending(pendingStuckByKey, '⚠️ Symbols stuck (no fresh candles)');
     flushPending(pendingUnstuckByKey, '✅ Symbols producing fresh candles again');
     flushPending(pendingLoadedByKey, '📥 Loaded on demand');
+    flushPending(pendingLoadFailedByKey, '⚠️ Symbols failed to load');
   };
 
   const scheduleBatchFlush = (): void => {
@@ -168,6 +190,11 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
 
   const noteSymbolLoaded = (interval: string, symbol: string): void => {
     pendingLoadedByKey.set(`${interval}:${symbol}`, { interval, symbol });
+    scheduleBatchFlush();
+  };
+
+  const noteSymbolLoadFailed = (interval: string, symbol: string): void => {
+    pendingLoadFailedByKey.set(`${interval}:${symbol}`, { interval, symbol });
     scheduleBatchFlush();
   };
 
@@ -298,12 +325,17 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
 
         return;
 
+      case 'symbolLoadFailed':
+        noteSymbolLoadFailed(event.interval, event.symbol);
+
+        return;
+
       default:
         return;
     }
   };
 
-  const shutdown = (): void => {
+  const shutdown = async (): Promise<void> => {
     cancelRestartTimer();
 
     if (batchTimer !== null) {
@@ -312,6 +344,7 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
     }
 
     flushBatch();
+    await drainPendingSends();
   };
 
   return { report, shutdown };

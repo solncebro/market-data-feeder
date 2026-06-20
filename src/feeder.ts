@@ -54,12 +54,12 @@ async function main(): Promise<void> {
     logger: feederLogger,
   });
 
-  const shutdown = async (reason?: string): Promise<void> => {
-    logger.info({ reason }, '[Feeder] Shutting down');
+  const shutdown = async (reason?: string, exitCode: number = 0): Promise<void> => {
+    logger.info({ reason, exitCode }, '[Feeder] Shutting down');
 
     await runWithHardExit(
       async () => {
-        healthMonitor.shutdown();
+        await healthMonitor.shutdown();
         await stopBot();
         await server.shutdown();
         await exchangeConnector.disconnect();
@@ -71,7 +71,7 @@ async function main(): Promise<void> {
       },
     );
 
-    process.exit(0);
+    process.exit(exitCode);
   };
 
   const healthMonitor = createHealthMonitor({
@@ -83,7 +83,7 @@ async function main(): Promise<void> {
     sendAlert: (message) => sendAlert(message),
     restartGuard,
     onRestart: (reason) => {
-      void shutdown(reason).catch((error: unknown) => {
+      void shutdown(reason, 1).catch((error: unknown) => {
         logger.error({ error }, '[Feeder] auto-restart shutdown failed');
         process.exit(1);
       });

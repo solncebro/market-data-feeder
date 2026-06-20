@@ -16,7 +16,8 @@ type HealthEvent =
   | { kind: 'feederReady'; exchangeName: string; host: string; port: number }
   | { kind: 'intervalLoadStarted'; interval: KlineInterval; symbolCount: number }
   | { kind: 'intervalLoadCompleted'; interval: KlineInterval; symbolCount: number }
-  | { kind: 'symbolLoadCompleted'; interval: KlineInterval; symbol: string };
+  | { kind: 'symbolLoadCompleted'; interval: KlineInterval; symbol: string }
+  | { kind: 'symbolLoadFailed'; interval: KlineInterval; symbol: string };
 
 interface HealthMonitorConfig {
   alertDedupMs: number;
@@ -35,7 +36,7 @@ interface HealthMonitorArgs {
 
 interface HealthMonitor {
   report: (event: HealthEvent) => void;
-  shutdown: () => void;
+  shutdown: () => Promise<void>;
 }
 
 export type { HealthEvent, HealthMonitor, HealthMonitorArgs, HealthMonitorConfig };

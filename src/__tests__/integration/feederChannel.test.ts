@@ -350,6 +350,29 @@ describe('feeder channel', () => {
     }
   });
 
+  it('releases the superseded scope when a client re-subscribes the same interval', async () => {
+    const source = new FakeFeederSource('30m', new Map([['BTCUSDT', [makeKline(1000)]]]));
+    const server = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => source });
+    await server.start();
+
+    const socket = new WebSocket(`ws://127.0.0.1:${server.getPort()}`);
+
+    try {
+      await new Promise<void>((resolve) => socket.on('open', () => resolve()));
+
+      socket.send(JSON.stringify({ type: 'subscribe', interval: '30m', scope: { kind: 'all' }, events: ['klineClosed'], wantMa: true }));
+      await waitFor(() => findAllSubscriberCount(server) === 1);
+
+      socket.send(JSON.stringify({ type: 'subscribe', interval: '30m', scope: { kind: 'symbols', symbolList: ['BTCUSDT'] }, events: ['klineClosed'], wantMa: true }));
+      await waitFor(() => (server.getStatus().intervalStatusList.find((item) => item.interval === '30m')?.refSymbolCount ?? 0) === 1);
+
+      expect(findAllSubscriberCount(server)).toBe(0);
+    } finally {
+      socket.close();
+      await server.shutdown();
+    }
+  });
+
   it('does not forward events a client did not subscribe to', async () => {
     const source = new FakeFeederSource('30m', new Map([['BTCUSDT', [makeKline(1000)]]]));
     const server = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => source });
