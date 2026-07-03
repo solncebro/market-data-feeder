@@ -5,7 +5,9 @@ On-demand market-data feeder. One exchange connection per process fans klines, m
 Two halves live in this package:
 
 - **Server (feeder)** — `dist/feeder.js`. Holds a single `ExchangeConnector`, loads kline data **on demand** (an interval/symbol is fetched only when a client first asks for it, reference-counted, torn down when idle) and serves it to clients.
-- **Client (`MarketDataClient`)** — imported by strategy apps. Mirrors the feed in memory and exposes the same read API + events as the in-process market-data manager, so strategy code does not change. Transport reuses `@solncebro/websocket-engine` (auto-reconnect + stale detection).
+- **Client (`MarketDataClient`)** — imported by strategy apps. Mirrors the feed in memory and exposes the same read API + events as the in-process market-data manager, so strategy code does not change. Transport reuses `@solncebro/websocket-engine` (auto-reconnect); data staleness is detected by the client itself and self-heals by re-creating the transport when staleness persists.
+
+> **`isStale()` latency depends on the event set.** A subscription that includes `klineUpdated`/`klineUpdatedTick` receives data within seconds, so `isStale()` flips ~45s after data stops. A **closed-only** subscription legitimately gets one message per interval, so its threshold is `interval + 45s` (30m → ~31 min, 4h → ~4h1m) and the self-heal reconnect fires at twice that. If your app uses `isStale()` as a tight trade gate on a closed-only channel, add `klineUpdated` to the event set (or pass a lower `staleThresholdMs`).
 
 ## Run the feeder
 

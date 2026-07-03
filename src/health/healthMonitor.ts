@@ -55,6 +55,10 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
 
   const lastAlertAtByKey = new Map<string, number>();
   const degradedReasonByKey = new Map<string, string>();
+  // Per-key degradation start times: escalation fires only when the OLDEST active degradation has
+  // outlived the grace, so a later degradation always gets its full grace even if an earlier one
+  // armed the timer and then cleared.
+  const degradedSinceMsByKey = new Map<string, number>();
   const inFlightSendSet = new Set<Promise<void>>();
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -151,6 +155,16 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
   const digestTimer = setInterval(emitDigest, config.digestIntervalMs);
   digestTimer.unref();
 
+  const armEscalationTimer = (): void => {
+    if (restartTimer !== null || degradedSinceMsByKey.size === 0) {
+      return;
+    }
+
+    const oldestSinceMs = Math.min(...degradedSinceMsByKey.values());
+    const delayMs = Math.max(0, oldestSinceMs + config.recoveryGraceMs - now());
+    restartTimer = setTimeout(runEscalation, delayMs);
+  };
+
   const runEscalation = (): void => {
     restartTimer = null;
 
@@ -158,10 +172,22 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
       return;
     }
 
+    const oldestSinceMs = Math.min(...degradedSinceMsByKey.values());
+
+    // The degradation that armed this timer cleared meanwhile — the survivors get their full grace.
+    if (now() - oldestSinceMs < config.recoveryGraceMs) {
+      armEscalationTimer();
+
+      return;
+    }
+
     const reason = Array.from(degradedReasonByKey.values()).join('; ');
 
     if (!restartGuard.canRestart()) {
-      emitAlert(`⛔ Degradation persists but the auto-restart limit for this window has been reached — stuck, manual intervention required. Reason: ${reason}`);
+      alertWithDedup('restartBlocked', `⛔ Degradation persists but the auto-restart limit for this window has been reached — stuck, manual intervention required. Reason: ${reason}`);
+      // Keep re-checking: the guard window rolls over, and a still-active degradation must restart
+      // once it allows again — without this re-arm the process would stay degraded forever.
+      restartTimer = setTimeout(runEscalation, config.recoveryGraceMs);
 
       return;
     }
@@ -174,13 +200,18 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
   const setDegraded = (key: string, reason: string): void => {
     degradedReasonByKey.set(key, reason);
 
-    if (restartTimer === null) {
-      restartTimer = setTimeout(runEscalation, config.recoveryGraceMs);
+    // First report wins: a repeated critical transport message (not edge-triggered at the source)
+    // must not push the escalation deadline forward.
+    if (!degradedSinceMsByKey.has(key)) {
+      degradedSinceMsByKey.set(key, now());
     }
+
+    armEscalationTimer();
   };
 
   const clearDegraded = (key: string): boolean => {
     const wasDegraded = degradedReasonByKey.delete(key);
+    degradedSinceMsByKey.delete(key);
     lastAlertAtByKey.delete(key);
 
     if (degradedReasonByKey.size === 0) {
@@ -289,6 +320,62 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
         return;
 
       case 'symbolLoadCompleted':
+        return;
+
+      case 'symbolDelisted': {
+        // A delisted or released symbol can never emit a recovery event — scrub it from the digest
+        // bookkeeping so the "Still unrecovered" list does not repeat it forever.
+        const key = `${event.interval}:${event.symbol}`;
+        windowDegradedKeySet.delete(key);
+        windowRecoveredKeySet.delete(key);
+        unrecoveredByKey.delete(key);
+        pendingRecoveryFailedByKey.delete(key);
+
+        return;
+      }
+
+      case 'intervalReleased': {
+        // The interval's source was torn down (last client left): its whole-source degradations can
+        // never clear via streamResumed/massStaleRecovered — dropping them prevents a spurious
+        // restart of a feeder whose "silent" interval simply no longer exists. Its per-symbol digest
+        // keys are scrubbed for the same reason as a delisting.
+        clearDegraded(`silent:${event.interval}`);
+        clearDegraded(`massStale:${event.interval}`);
+
+        const keyPrefix = `${event.interval}:`;
+
+        for (const key of Array.from(windowDegradedKeySet)) {
+          if (key.startsWith(keyPrefix)) {
+            windowDegradedKeySet.delete(key);
+          }
+        }
+
+        for (const key of Array.from(windowRecoveredKeySet)) {
+          if (key.startsWith(keyPrefix)) {
+            windowRecoveredKeySet.delete(key);
+          }
+        }
+
+        for (const key of Array.from(unrecoveredByKey.keys())) {
+          if (key.startsWith(keyPrefix)) {
+            unrecoveredByKey.delete(key);
+          }
+        }
+
+        for (const key of Array.from(pendingRecoveryFailedByKey.keys())) {
+          if (key.startsWith(keyPrefix)) {
+            pendingRecoveryFailedByKey.delete(key);
+          }
+        }
+
+        return;
+      }
+
+      case 'symbolSyncAnomaly':
+        // Not escalating: data keeps flowing; the guard defers the removals itself. The operator
+        // must still hear about it immediately — a repeated anomaly means the exchange list is off.
+        alertWithDedup(`symbolSyncAnomaly:${event.interval}`, `⚠️ Symbol sync anomaly on [${event.interval}]: the exchange list dropped ${event.deferredCount}/${event.symbolCount} loaded symbols — removals deferred until the next hourly sync confirms them.`);
+
         return;
 
       case 'symbolLoadFailed':

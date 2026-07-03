@@ -1,10 +1,14 @@
 import type { FeederLogger } from '../server/feederServer.types.js';
+import { withTimeout } from '../utils/timeout.js';
+
+const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
 
 interface ChannelConnectivityMonitorArgs {
   probe: () => Promise<void>;
   logger: FeederLogger;
   retryDelayMs: number;
   recheckIntervalMs: number;
+  probeTimeoutMs?: number;
 }
 
 interface ChannelConnectivityMonitor {
@@ -40,6 +44,8 @@ function startChannelConnectivityMonitor(args: ChannelConnectivityMonitorArgs): 
     scheduleNext(args.retryDelayMs);
   };
 
+  const probeTimeoutMs = args.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+
   const runCheck = (): void => {
     timer = null;
 
@@ -47,7 +53,11 @@ function startChannelConnectivityMonitor(args: ChannelConnectivityMonitorArgs): 
       return;
     }
 
-    args.probe().then(handleSuccess).catch(handleFailure);
+    // The next check is scheduled only from this probe's settlement — a probe that never settles
+    // (half-open connection) would otherwise silently kill the monitor forever, so it is time-boxed.
+    withTimeout(args.probe(), probeTimeoutMs, `control channel probe timed out after ${probeTimeoutMs}ms`)
+      .then(handleSuccess)
+      .catch(handleFailure);
   };
 
   runCheck();

@@ -8,10 +8,13 @@ import { KLINE_BUFFER_SIZE, STALENESS_THRESHOLD_MULTIPLIER, resolveIntervalMs } 
 import { calculateAllMaValues } from './indicators.js';
 import { crossesMassStaleThreshold } from './massStale.js';
 import { computeSymbolListDelta } from './symbolListDelta.js';
+import { evaluateSymbolRemovalList } from './symbolRemovalGuard.js';
+import { mergeRepairedKlines } from './gapRepair.js';
 import { withTimeout } from '../utils/timeout.js';
 import { startIntervalScheduler } from '../utils/intervalScheduler.js';
 import type { IntervalSchedulerHandle } from '../utils/intervalScheduler.js';
 import type { FeederSource, StreamLiveness } from '../server/feederSource.types.js';
+import type { SymbolLoadOutcome } from '../server/subscriptionRegistry.types.js';
 
 const KLINE_UPDATE_THROTTLE_MS = 5000;
 const STALENESS_CHECK_INTERVAL_MS = 60_000;
@@ -28,6 +31,18 @@ const VOLUME_REFRESH_INTERVAL_MS = 30_000;
 const MASS_STALE_RATIO_THRESHOLD = 0.3;
 const MASS_STALE_MIN_SYMBOLS = 20;
 
+// Gap repair: a candle missed by the stream (or sealed locally without the exchange's closing
+// frame) is healed by a REST refetch merged into the buffer, then pushed to clients as a reseed.
+// The per-symbol cooldown bounds the REST cost of sparse symbols whose "gaps" are legit (the
+// exchange never created the candle), and the concurrency cap keeps a mass-gap avalanche after a
+// transport blip from monopolizing the shared backfill pacer.
+const GAP_REPAIR_COOLDOWN_MS = 600_000;
+const MAX_CONCURRENT_GAP_REPAIRS = 3;
+const GAP_REPAIR_BASE_FETCH_COUNT = 2;
+
+// Fallback pacer for the no-arg constructor (tests). Production injects an exchange-tuned queue from
+// feeder.ts (resolveBackfillRequestsPerSecond) — Binance must run slower than this to stay under its
+// per-IP REQUEST_WEIGHT budget.
 const KLINE_BACKFILL_REQUESTS_PER_SECOND = 80;
 
 const DEFAULT_BACKFILL_QUEUE = new RateLimitedRequestQueue({
@@ -64,6 +79,13 @@ class MarketDataManager extends EventEmitter implements FeederSource {
   private isStreamSilent: boolean = false;
   private isMassStale: boolean = false;
   private isShutDown: boolean = false;
+  private pendingRemovalSet: Set<string> = new Set();
+  private isSymbolSyncAnomalyActive: boolean = false;
+  private readonly lastGapRepairAtMsBySymbol: Map<string, number> = new Map();
+  private readonly gapRepairInFlightSet: Set<string> = new Set();
+  private readonly gapRepairPendingSymbolList: string[] = [];
+  private readonly gapRepairFetchCountBySymbol: Map<string, number> = new Map();
+  private locallyClosedCandleCount: number = 0;
   private stalenessSchedulerHandle: IntervalSchedulerHandle | null = null;
   private silenceSchedulerHandle: IntervalSchedulerHandle | null = null;
   private volumeSchedulerHandle: IntervalSchedulerHandle | null = null;
@@ -84,7 +106,17 @@ class MarketDataManager extends EventEmitter implements FeederSource {
   }
 
   async loadAllSymbols(): Promise<void> {
-    const allSymbolList = await this.exchangeConnector.getFuturesSymbols();
+    const allSymbolList = await this.exchangeConnector.getFuturesSymbols({ excludeTradifi: true });
+
+    // Teardown can land at any await of this method (the registry defers it until the load settles,
+    // but the source may also be shut down directly) — from here on every stage bails out on
+    // isShutDown so a dead source never enqueues backfill work or subscribes exchange streams.
+    if (this.isShutDown) {
+      logger.warn({}, `[MarketData] loadAllSymbols aborted — source shut down during the symbol-list fetch [${this.interval}]`);
+
+      return;
+    }
+
     const usdtSymbolList = allSymbolList.filter((symbol) => symbol.endsWith('USDT'));
 
     logger.info({ symbolCount: usdtSymbolList.length, filtered: allSymbolList.length - usdtSymbolList.length }, `[MarketData] Starting kline loading: ${usdtSymbolList.length} USDT symbols [${this.interval}]`);
@@ -92,6 +124,13 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     this.emit('intervalLoadStarted', usdtSymbolList.length);
 
     await this.loadKlines(usdtSymbolList);
+
+    if (this.isShutDown) {
+      logger.warn({ requestedCount: usdtSymbolList.length }, `[MarketData] loadAllSymbols aborted — source shut down during backfill; skipping subscriptions and load accounting [${this.interval}]`);
+
+      return;
+    }
+
     this.subscribeToKlines(usdtSymbolList);
 
     const loadedCount = this.klineListBySymbol.size;
@@ -202,34 +241,54 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     return staleSymbolList;
   }
 
-  async ensureSymbolLoaded(symbol: string): Promise<boolean> {
+  async ensureSymbolLoaded(symbol: string): Promise<SymbolLoadOutcome> {
     if (this.klineListBySymbol.has(symbol)) {
-      return false;
+      return 'alreadyLoaded';
     }
 
     const exchangeClient = this.exchangeConnector.futures;
+    const exchangeSymbolList = await this.exchangeConnector.getFuturesSymbols({ excludeTradifi: true });
+
+    // A non-empty exchange list that lacks the symbol = legit absence (delisted / never listed / a
+    // typo that passed the boundary pattern) — an empty snapshot is the correct answer, not an
+    // endless retry loop. An EMPTY list means the list read itself failed (getFuturesSymbols
+    // swallows errors into []) — fall through to the REST fetch, which reports its own failure.
+    if (exchangeSymbolList.length > 0 && !exchangeSymbolList.includes(symbol)) {
+      logger.warn({ symbol }, `[MarketData] ${symbol} is not on the exchange — skipping load [${this.interval}]`);
+
+      return 'notOnExchange';
+    }
 
     logger.info({ symbol }, `[MarketData] ${symbol} ensureSymbolLoaded fetchKlines request limit=${KLINE_BUFFER_SIZE} [${this.interval}]`);
 
     try {
       const rawKlineList = await this.backfillQueue.execute(
-        () => this.fetchKlinesWithTimeout(exchangeClient.fetchKlines(symbol, this.interval, { limit: KLINE_BUFFER_SIZE }), LOAD_KLINES_TIMEOUT_MS, symbol),
+        () => (this.isShutDown ? Promise.resolve([] as Kline[]) : this.fetchKlinesWithTimeout(exchangeClient.fetchKlines(symbol, this.interval, { limit: KLINE_BUFFER_SIZE }), LOAD_KLINES_TIMEOUT_MS, symbol)),
         `ensureSymbolLoaded ${symbol} [${this.interval}]`,
       );
 
       if (this.isShutDown) {
-        return false;
+        return 'aborted';
+      }
+
+      // The bulk load may have populated (and subscribed) this symbol while our fetch was queued
+      // behind the shared pacer — its live buffer wins over this stale copy.
+      if (this.klineListBySymbol.has(symbol)) {
+        return 'alreadyLoaded';
       }
 
       const klineList = rawKlineList.slice(-KLINE_BUFFER_SIZE);
 
       logger.info({ symbol, klineCount: klineList.length }, `[MarketData] ${symbol} ensureSymbolLoaded fetchKlines response klineCount=${klineList.length} [${this.interval}]`);
 
+      // Listed but no candles yet (e.g. a contract published before trading starts): a legit
+      // absence, not a transient failure — throwing here would blank a whole multi-symbol scope
+      // into a 4001 retry loop because of one such symbol. The digest still hears about it.
       if (klineList.length === 0) {
-        logger.warn({ symbol }, `[MarketData] ${symbol} ensureSymbolLoaded — empty kline list, skipping subscription [${this.interval}]`);
+        logger.warn({ symbol }, `[MarketData] ${symbol} ensureSymbolLoaded — empty kline history, skipping subscription [${this.interval}]`);
         this.emit('symbolLoadFailed', symbol);
 
-        return false;
+        return 'noHistory';
       }
 
       markBackfilledHistoryClosed(klineList);
@@ -246,16 +305,27 @@ class MarketDataManager extends EventEmitter implements FeederSource {
       logger.info({ symbol }, `[MarketData] ${symbol} ensureSymbolLoaded — subscribed [${this.interval}]`);
       this.emit('symbolLoadCompleted', symbol);
 
-      return true;
+      return 'loaded';
     } catch (error: unknown) {
       logger.error({ symbol, error }, `[MarketData] ${symbol} ensureSymbolLoaded failed [${this.interval}]`);
       this.emit('symbolLoadFailed', symbol);
 
-      return false;
+      throw error;
     }
   }
 
   releaseSymbol(symbol: string): void {
+    // Tell the health monitor the symbol's streams are gone for good (its digest keys can never
+    // recover), and pull it from the gap-repair queue so a released symbol does not burn a paced
+    // REST request on a buffer that no longer exists.
+    this.emit('symbolReleased', symbol);
+
+    const pendingRepairIndex = this.gapRepairPendingSymbolList.indexOf(symbol);
+
+    if (pendingRepairIndex !== -1) {
+      this.gapRepairPendingSymbolList.splice(pendingRepairIndex, 1);
+    }
+
     const exchangeClient = this.exchangeConnector.futures;
     const subscription = this.subscriptionBySymbol.get(symbol);
 
@@ -277,38 +347,91 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     this.persistentStaleEmittedSet.delete(symbol);
     this.skippedOlderKlineCountBySymbol.delete(symbol);
     this.lastEmittedVolumeBySymbol.delete(symbol);
+    this.lastGapRepairAtMsBySymbol.delete(symbol);
+    this.gapRepairFetchCountBySymbol.delete(symbol);
   }
 
   async syncAllSymbols(): Promise<void> {
     try {
-      const allSymbolList = await this.exchangeConnector.getFuturesSymbols();
+      // getFuturesSymbols reads an in-memory cache that otherwise loads once at initialize() —
+      // without this refresh the hourly sync compares the cached list against itself and can never
+      // see a listing or delisting.
+      await this.exchangeConnector.refreshFuturesTradeSymbols();
+
+      const allSymbolList = await this.exchangeConnector.getFuturesSymbols({ excludeTradifi: true });
       const usdtSymbolList = allSymbolList.filter((symbol) => symbol.endsWith('USDT'));
+
+      if (usdtSymbolList.length === 0) {
+        logger.warn({ loadedSymbolCount: this.klineListBySymbol.size }, `[MarketData] Symbol sync skipped — exchange returned an empty symbol list [${this.interval}]`);
+
+        return;
+      }
+
+      const loadedSymbolCount = this.klineListBySymbol.size;
       const delta = computeSymbolListDelta({ loadedSymbolList: this.getSymbolList(), exchangeSymbolList: usdtSymbolList });
 
       if (delta.addedSymbolList.length === 0 && delta.removedSymbolList.length === 0) {
+        this.pendingRemovalSet = new Set();
+        this.resolveSymbolSyncAnomaly();
+
         return;
       }
 
       for (const symbol of delta.addedSymbolList) {
-        const isLoaded = await this.ensureSymbolLoaded(symbol);
+        try {
+          const outcome = await this.ensureSymbolLoaded(symbol);
 
-        if (isLoaded) {
-          this.emit('symbolAdded', symbol);
+          if (outcome === 'loaded') {
+            this.emit('symbolAdded', symbol);
+          }
+        } catch (error: unknown) {
+          // symbolLoadFailed was already emitted inside ensureSymbolLoaded (feeds the digest); the
+          // next hourly sync retries the listing, and one bad listing must not kill the whole sync.
+          logger.warn({ symbol, error }, `[MarketData] ${symbol} new listing failed to load — will retry on the next sync [${this.interval}]`);
         }
       }
 
-      for (const symbol of delta.removedSymbolList) {
+      const removalDecision = evaluateSymbolRemovalList({
+        removedSymbolList: delta.removedSymbolList,
+        loadedSymbolCount,
+        pendingRemovalSet: this.pendingRemovalSet,
+      });
+      this.pendingRemovalSet = removalDecision.nextPendingRemovalSet;
+
+      for (const symbol of removalDecision.approvedRemovalList) {
         this.emit('symbolRemoved', symbol);
         this.releaseSymbol(symbol);
       }
 
-      logger.info({ addedCount: delta.addedSymbolList.length, removedCount: delta.removedSymbolList.length }, `[MarketData] Symbol list synced — +${delta.addedSymbolList.length} / -${delta.removedSymbolList.length} [${this.interval}]`);
+      if (removalDecision.deferredRemovalList.length > 0) {
+        logger.error(
+          { deferredCount: removalDecision.deferredRemovalList.length, loadedSymbolCount },
+          `[MarketData] Symbol sync anomaly — exchange list dropped ${removalDecision.deferredRemovalList.length}/${loadedSymbolCount} symbols; removals deferred until the next sync confirms [${this.interval}]`,
+        );
+
+        if (!this.isSymbolSyncAnomalyActive) {
+          this.isSymbolSyncAnomalyActive = true;
+          this.emit('symbolSyncAnomaly', removalDecision.deferredRemovalList.length, loadedSymbolCount);
+        }
+      } else {
+        this.resolveSymbolSyncAnomaly();
+      }
+
+      logger.info({ addedCount: delta.addedSymbolList.length, removedCount: removalDecision.approvedRemovalList.length, deferredCount: removalDecision.deferredRemovalList.length }, `[MarketData] Symbol list synced — +${delta.addedSymbolList.length} / -${removalDecision.approvedRemovalList.length} (deferred ${removalDecision.deferredRemovalList.length}) [${this.interval}]`);
     } catch (error: unknown) {
       logger.error({ error }, `[MarketData] syncAllSymbols failed [${this.interval}]`);
     }
   }
 
+  private resolveSymbolSyncAnomaly(): void {
+    if (this.isSymbolSyncAnomalyActive) {
+      this.isSymbolSyncAnomalyActive = false;
+      logger.info({}, `[MarketData] Symbol sync anomaly cleared [${this.interval}]`);
+    }
+  }
+
   async shutdown(): Promise<void> {
+    this.emit('sourceShutdown');
     this.isShutDown = true;
     const exchangeClient = this.exchangeConnector.futures;
 
@@ -328,11 +451,17 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     }
 
     for (const subscription of this.subscriptionBySymbol.values()) {
-      exchangeClient.unsubscribeKlines(subscription);
+      try {
+        exchangeClient.unsubscribeKlines(subscription);
+      } catch (error: unknown) {
+        logger.warn({ symbol: subscription.symbol, error }, `[MarketData] ${subscription.symbol} shutdown — unsubscribeKlines failed (continuing cleanup) [${this.interval}]`);
+      }
     }
 
     this.subscriptionBySymbol.clear();
     this.handlerBySymbol.clear();
+    this.gapRepairPendingSymbolList.length = 0;
+    this.gapRepairFetchCountBySymbol.clear();
   }
 
   private async fetchKlinesWithTimeout(fetchPromise: Promise<Kline[]>, timeoutMs: number, symbol: string): Promise<Kline[]> {
@@ -346,8 +475,10 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     const fetchResultList = await Promise.all(
       symbolList.map(async (symbol) => {
         try {
+          // The shut-down check runs INSIDE the queue task: entries already queued behind the
+          // process-wide pacer must not fire their REST request after teardown.
           const rawKlineList = await this.backfillQueue.execute(
-            () => this.fetchKlinesWithTimeout(exchangeClient.fetchKlines(symbol, this.interval, { limit: KLINE_BUFFER_SIZE }), LOAD_KLINES_TIMEOUT_MS, symbol),
+            () => (this.isShutDown ? Promise.resolve([] as Kline[]) : this.fetchKlinesWithTimeout(exchangeClient.fetchKlines(symbol, this.interval, { limit: KLINE_BUFFER_SIZE }), LOAD_KLINES_TIMEOUT_MS, symbol)),
             `fetchKlines ${symbol} [${this.interval}]`,
           );
           const klineList = rawKlineList.slice(-KLINE_BUFFER_SIZE);
@@ -367,8 +498,20 @@ class MarketDataManager extends EventEmitter implements FeederSource {
       }),
     );
 
+    if (this.isShutDown) {
+      return;
+    }
+
     for (const { symbol, klineList } of fetchResultList) {
       if (klineList.length === 0) {
+        continue;
+      }
+
+      // A symbol with a live handler already went live via the on-demand path while this bulk load
+      // was fetching — its buffer is being fed by the stream and must not be rolled back to this
+      // (older) REST copy. Handler presence is the discriminator on purpose: a stale buffer left by
+      // a previously FAILED bulk attempt has NO handler and must be overwritten.
+      if (this.handlerBySymbol.has(symbol)) {
         continue;
       }
 
@@ -386,6 +529,10 @@ class MarketDataManager extends EventEmitter implements FeederSource {
   }
 
   private subscribeToKlines(symbolList: string[]): void {
+    if (this.isShutDown) {
+      return;
+    }
+
     const exchangeClient = this.exchangeConnector.futures;
 
     for (const symbol of symbolList) {
@@ -466,12 +613,27 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     }
 
     const isNewCandle = kline.openTimestamp > lastKline.openTimestamp;
+    const intervalMs = resolveIntervalMs(this.interval);
+    const missedCandleCount = isNewCandle ? Math.floor((kline.openTimestamp - lastKline.openTimestamp) / intervalMs) - 1 : 0;
+    let repairFetchCount = 0;
 
     if (isNewCandle && lastKline.isClosed !== true) {
       lastKline.isClosed = true;
+      // Sealed locally = the exchange's closing frame was lost; the sealed values are the last seen,
+      // not the true close — schedule a REST repair to correct them.
+      this.locallyClosedCandleCount += 1;
+      repairFetchCount = GAP_REPAIR_BASE_FETCH_COUNT;
 
       const maValues = this.recalculateAndStoreMa(symbol, klineList);
       this.emitGuarded('klineClosed', symbol, lastKline, maValues);
+    }
+
+    if (missedCandleCount > 0) {
+      repairFetchCount = Math.max(repairFetchCount, missedCandleCount + GAP_REPAIR_BASE_FETCH_COUNT);
+    }
+
+    if (repairFetchCount > 0) {
+      this.scheduleGapRepair(symbol, repairFetchCount);
     }
 
     if (kline.isClosed === true) {
@@ -526,6 +688,97 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     this.emitTickGuarded(symbol, kline);
   }
 
+  private scheduleGapRepair(symbol: string, fetchCount: number): void {
+    if (this.isShutDown) {
+      return;
+    }
+
+    const previousFetchCount = this.gapRepairFetchCountBySymbol.get(symbol) ?? 0;
+    this.gapRepairFetchCountBySymbol.set(symbol, Math.min(Math.max(fetchCount, previousFetchCount), KLINE_BUFFER_SIZE));
+
+    if (this.gapRepairInFlightSet.has(symbol) || this.gapRepairPendingSymbolList.includes(symbol)) {
+      return;
+    }
+
+    const lastRepairAtMs = this.lastGapRepairAtMsBySymbol.get(symbol);
+
+    if (lastRepairAtMs !== undefined && Date.now() - lastRepairAtMs < GAP_REPAIR_COOLDOWN_MS) {
+      return;
+    }
+
+    this.gapRepairPendingSymbolList.push(symbol);
+    this.drainGapRepairQueue();
+  }
+
+  private drainGapRepairQueue(): void {
+    while (!this.isShutDown && this.gapRepairInFlightSet.size < MAX_CONCURRENT_GAP_REPAIRS && this.gapRepairPendingSymbolList.length > 0) {
+      const symbol = this.gapRepairPendingSymbolList.shift() as string;
+      this.gapRepairInFlightSet.add(symbol);
+
+      void this.runGapRepair(symbol).finally(() => {
+        this.gapRepairInFlightSet.delete(symbol);
+        this.drainGapRepairQueue();
+      });
+    }
+  }
+
+  private async runGapRepair(symbol: string): Promise<void> {
+    // Released/delisted while waiting in the queue — no buffer to repair, no REST slot to burn.
+    if (!this.klineListBySymbol.has(symbol)) {
+      this.gapRepairFetchCountBySymbol.delete(symbol);
+
+      return;
+    }
+
+    const fetchCount = this.gapRepairFetchCountBySymbol.get(symbol) ?? GAP_REPAIR_BASE_FETCH_COUNT;
+    this.gapRepairFetchCountBySymbol.delete(symbol);
+    this.lastGapRepairAtMsBySymbol.set(symbol, Date.now());
+    const exchangeClient = this.exchangeConnector.futures;
+
+    try {
+      const rawKlineList = await this.backfillQueue.execute(
+        () => (this.isShutDown ? Promise.resolve([] as Kline[]) : this.fetchKlinesWithTimeout(exchangeClient.fetchKlines(symbol, this.interval, { limit: fetchCount }), LOAD_KLINES_TIMEOUT_MS, symbol)),
+        `gapRepair ${symbol} [${this.interval}]`,
+      );
+
+      if (this.isShutDown) {
+        return;
+      }
+
+      const bufferKlineList = this.klineListBySymbol.get(symbol);
+
+      // Released or delisted while the repair was in flight — do not resurrect the buffer.
+      if (bufferKlineList === undefined) {
+        return;
+      }
+
+      if (rawKlineList.length === 0) {
+        logger.warn({ symbol, fetchCount }, `[MarketData] ${symbol} gap repair got an empty history — the hole stays until the next detection [${this.interval}]`);
+        this.emit('symbolLoadFailed', symbol);
+
+        return;
+      }
+
+      const fetchedKlineList = rawKlineList.slice(-KLINE_BUFFER_SIZE);
+      markBackfilledHistoryClosed(fetchedKlineList);
+
+      const formingOpenTimestamp = this.currentKlineBySymbol.get(symbol)?.openTimestamp ?? null;
+      const mergeResult = mergeRepairedKlines({ bufferKlineList, fetchedKlineList, formingOpenTimestamp, maxBufferSize: KLINE_BUFFER_SIZE });
+
+      if (mergeResult.changedCount === 0) {
+        return;
+      }
+
+      this.klineListBySymbol.set(symbol, mergeResult.mergedKlineList);
+      this.recalculateAndStoreMa(symbol, mergeResult.mergedKlineList);
+      logger.info({ symbol, changedCount: mergeResult.changedCount, fetchCount }, `[MarketData] ${symbol} gap repair merged ${mergeResult.changedCount} candle(s) — reseeding clients [${this.interval}]`);
+      this.emit('symbolReseeded', symbol);
+    } catch (error: unknown) {
+      logger.error({ symbol, error }, `[MarketData] ${symbol} gap repair failed — the hole stays until the next detection [${this.interval}]`);
+      this.emit('symbolLoadFailed', symbol);
+    }
+  }
+
   private recalculateAndStoreMa(symbol: string, klineList: Kline[]): MaValues {
     const maValues = calculateAllMaValues(klineList);
     this.maValuesBySymbol.set(symbol, maValues);
@@ -573,7 +826,9 @@ class MarketDataManager extends EventEmitter implements FeederSource {
         this.throttledMaRecomputeCount = 0;
         const skippedStaleEmitCount = this.skippedStaleEmitCount;
         this.skippedStaleEmitCount = 0;
-        logger.info({ tickCount, symbolCount, persistentStaleCount, throttledMaRecomputeCount, skippedStaleEmitCount }, `[MarketData] Staleness watchdog alive — tick #${tickCount}, ${symbolCount} symbols monitored, ${persistentStaleCount} persistent stale, ${throttledMaRecomputeCount} MA recomputes throttled, ${skippedStaleEmitCount} stale emits skipped in last period [${this.interval}]`);
+        const locallyClosedCandleCount = this.locallyClosedCandleCount;
+        this.locallyClosedCandleCount = 0;
+        logger.info({ tickCount, symbolCount, persistentStaleCount, throttledMaRecomputeCount, skippedStaleEmitCount, locallyClosedCandleCount }, `[MarketData] Staleness watchdog alive — tick #${tickCount}, ${symbolCount} symbols monitored, ${persistentStaleCount} persistent stale, ${throttledMaRecomputeCount} MA recomputes throttled, ${skippedStaleEmitCount} stale emits skipped, ${locallyClosedCandleCount} candles sealed locally in last period [${this.interval}]`);
         this.flushSkippedOlderKlineCounters();
       },
     });

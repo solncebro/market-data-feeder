@@ -146,4 +146,10 @@ describe('formatStaleSymbolMessage', () => {
     expect(message).toContain('30m');
     expect(message.toLowerCase()).toContain('no stale');
   });
+
+  it('renders tiny prices with enough precision instead of a misleading "0"', () => {
+    const message = formatSymbolCard(makeSymbolDiagnostics({ lastPrice: 0.00001234 }));
+
+    expect(message).toContain('0.00001234');
+  });
 });

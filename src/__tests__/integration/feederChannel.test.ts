@@ -6,6 +6,7 @@ import type { WebSocketLogger } from '@solncebro/websocket-engine';
 
 import type { Kline, KlineInterval, MaValues, StaleSymbolInfo } from '../../domain/marketData.types.js';
 import type { FeederSource } from '../../server/feederSource.types.js';
+import type { SymbolLoadOutcome } from '../../server/subscriptionRegistry.types.js';
 import type { FeederLogger } from '../../server/feederServer.types.js';
 import { FeederServer } from '../../server/feederServer.js';
 import { MarketDataClient } from '../../client/marketDataClient.js';
@@ -63,8 +64,8 @@ class FakeFeederSource extends EventEmitter implements FeederSource {
     return undefined;
   }
 
-  async ensureSymbolLoaded(): Promise<boolean> {
-    return true;
+  async ensureSymbolLoaded(): Promise<SymbolLoadOutcome> {
+    return 'loaded';
   }
 
   releaseSymbol(): void {
@@ -316,12 +317,10 @@ describe('feeder channel', () => {
 
       await waitFor(() => server.getStatus().clientCount === 0);
 
-      expect(findAllSubscriberCount(server)).toBe(0);
-
+      // The release is serialized behind the in-flight subscribe op: the counter is held while the
+      // load runs and drops to zero right after it settles (no acquire/release race).
       resolveLoad?.();
-      await new Promise<void>((resolve) => setTimeout(resolve, 20));
-
-      expect(findAllSubscriberCount(server)).toBe(0);
+      await waitFor(() => findAllSubscriberCount(server) === 0);
     } finally {
       resolveLoad?.();
       await server.shutdown();
@@ -437,6 +436,71 @@ describe('feeder channel', () => {
       await closedPromise;
 
       expect(updatedCount).toBe(0);
+    } finally {
+      client.close();
+      await server.shutdown();
+    }
+  });
+
+  it('prunes per-symbol update timestamps for symbols dropped by a reconnect snapshot', async () => {
+    const klineListBySymbol = new Map([['BTCUSDT', [makeKline(1000)]], ['ETHUSDT', [makeKline(1000)]]]);
+    const source = new FakeFeederSource('30m', klineListBySymbol);
+    const server = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => source });
+    await server.start();
+
+    const client = new MarketDataClient({
+      url: `ws://127.0.0.1:${server.getPort()}`,
+      interval: '30m',
+      scope: { kind: 'all' },
+      events: ['klineClosed', 'klineUpdated', 'klineUpdatedTick'],
+      wantMa: true,
+      logger: NOOP_WS_LOGGER,
+      staleThresholdMs: 200,
+      staleCheckIntervalMs: 50,
+    });
+
+    try {
+      await client.waitUntilReady(3000);
+      source.emit('klineClosed', 'ETHUSDT', makeKline(2000), makeMa(20));
+      await waitFor(() => client.getLastUpdateTimestamp('ETHUSDT') !== undefined);
+
+      // ETHUSDT silently disappears server-side; the client reconnects on staleness and receives a
+      // snapshot without it.
+      klineListBySymbol.delete('ETHUSDT');
+      const restoredPromise = new Promise<void>((resolve) => {
+        client.once('connectionRestored', () => {
+          resolve();
+        });
+      });
+      await restoredPromise;
+
+      expect(client.getSymbolList()).toEqual(['BTCUSDT']);
+      expect(client.getLastUpdateTimestamp('ETHUSDT')).toBeUndefined();
+    } finally {
+      client.close();
+      await server.shutdown();
+    }
+  }, 15_000);
+
+  it('reseeds the client mirror mid-stream when the source repairs a symbol', async () => {
+    const source = new FakeFeederSource('30m', new Map([['BTCUSDT', [makeKline(1000)]]]));
+    const server = new FeederServer({ port: 0, logger: NOOP_FEEDER_LOGGER, createSource: () => source });
+    await server.start();
+
+    const client = buildClient(server.getPort(), ['klineClosed']);
+
+    try {
+      await client.waitUntilReady(3000);
+      expect(client.getKlineList('BTCUSDT')).toHaveLength(1);
+
+      // The source healed a hole: the buffer now holds the repaired history.
+      source.setSymbolKlines('BTCUSDT', [makeKline(1000), makeKline(2000), makeKline(3000)]);
+      source.emit('symbolReseeded', 'BTCUSDT');
+
+      await waitFor(() => client.getKlineList('BTCUSDT').length === 3);
+      expect(client.getKlineList('BTCUSDT').map((kline) => kline.openTimestamp)).toEqual([1000, 2000, 3000]);
+      expect(client.isStale()).toBe(false);
+      expect(client.getSymbolList()).toEqual(['BTCUSDT']);
     } finally {
       client.close();
       await server.shutdown();

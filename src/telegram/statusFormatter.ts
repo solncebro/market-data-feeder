@@ -48,6 +48,14 @@ function formatAge(timestampMs: number | undefined): string {
 }
 
 function formatNumber(value: number): string {
+  // toLocaleString caps at 3 fraction digits, which renders tiny meme-perp prices as a misleading
+  // "0" — give small values enough dynamic precision instead.
+  if (value !== 0 && Math.abs(value) < 0.001) {
+    const fractionDigitCount = Math.min(12, Math.ceil(-Math.log10(Math.abs(value))) + 3);
+
+    return value.toFixed(fractionDigitCount);
+  }
+
   return value.toLocaleString('en-US');
 }
 

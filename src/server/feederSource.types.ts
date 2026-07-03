@@ -1,5 +1,5 @@
 import type { Kline, MaValues, StaleSymbolInfo } from '../domain/marketData.types.js';
-import type { IntervalLoadListener, KlineTickListener, KlineWithMaListener, SourceMassStaleListener, StreamSilenceListener, SymbolNameListener, Volume24hListener } from '../domain/events.types.js';
+import type { IntervalLoadListener, KlineTickListener, KlineWithMaListener, SourceLifecycleListener, SourceMassStaleListener, StreamSilenceListener, SymbolNameListener, SymbolSyncAnomalyListener, Volume24hListener } from '../domain/events.types.js';
 import type { ManagedSource } from './subscriptionRegistry.types.js';
 
 interface StreamLiveness {
@@ -25,17 +25,21 @@ interface FeederSource extends ManagedSource {
   getPersistentStaleCount: () => number;
   on(eventName: 'klineClosed' | 'klineUpdated', listener: KlineWithMaListener): this;
   on(eventName: 'klineUpdatedTick', listener: KlineTickListener): this;
-  on(eventName: 'symbolAdded' | 'symbolRemoved' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted' | 'symbolLoadFailed', listener: SymbolNameListener): this;
+  on(eventName: 'symbolAdded' | 'symbolRemoved' | 'symbolReseeded' | 'symbolReleased' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted' | 'symbolLoadFailed', listener: SymbolNameListener): this;
+  on(eventName: 'sourceShutdown', listener: SourceLifecycleListener): this;
   on(eventName: 'volume24h', listener: Volume24hListener): this;
   on(eventName: 'streamSilent' | 'streamResumed', listener: StreamSilenceListener): this;
   on(eventName: 'sourceMassStale' | 'sourceMassStaleRecovered', listener: SourceMassStaleListener): this;
+  on(eventName: 'symbolSyncAnomaly', listener: SymbolSyncAnomalyListener): this;
   on(eventName: 'intervalLoadStarted' | 'intervalLoadCompleted', listener: IntervalLoadListener): this;
   off(eventName: 'klineClosed' | 'klineUpdated', listener: KlineWithMaListener): this;
   off(eventName: 'klineUpdatedTick', listener: KlineTickListener): this;
-  off(eventName: 'symbolAdded' | 'symbolRemoved' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted' | 'symbolLoadFailed', listener: SymbolNameListener): this;
+  off(eventName: 'symbolAdded' | 'symbolRemoved' | 'symbolReseeded' | 'symbolReleased' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted' | 'symbolLoadFailed', listener: SymbolNameListener): this;
+  off(eventName: 'sourceShutdown', listener: SourceLifecycleListener): this;
   off(eventName: 'volume24h', listener: Volume24hListener): this;
   off(eventName: 'streamSilent' | 'streamResumed', listener: StreamSilenceListener): this;
   off(eventName: 'sourceMassStale' | 'sourceMassStaleRecovered', listener: SourceMassStaleListener): this;
+  off(eventName: 'symbolSyncAnomaly', listener: SymbolSyncAnomalyListener): this;
   off(eventName: 'intervalLoadStarted' | 'intervalLoadCompleted', listener: IntervalLoadListener): this;
 }
 

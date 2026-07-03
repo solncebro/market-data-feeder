@@ -96,7 +96,7 @@ describe('MarketDataManager post-shutdown guard', () => {
     holder.resolve?.([makeKline(0)]);
     const result = await loadPromise;
 
-    expect(result).toBe(false);
+    expect(result).toBe('aborted');
     expect(loadedSpy).not.toHaveBeenCalled();
     expect(futuresClient.subscribeKlines).not.toHaveBeenCalled();
   });

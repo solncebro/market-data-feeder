@@ -17,7 +17,7 @@ function makeFakeSource(interval: KlineInterval): FakeSource {
   return {
     start: vi.fn(),
     loadAllSymbols: vi.fn(async () => undefined),
-    ensureSymbolLoaded: vi.fn(async () => true),
+    ensureSymbolLoaded: vi.fn(async () => 'loaded' as const),
     releaseSymbol: vi.fn(),
     syncAllSymbols: vi.fn(async () => undefined),
     shutdown: vi.fn(async () => undefined),

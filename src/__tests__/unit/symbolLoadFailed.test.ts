@@ -49,7 +49,7 @@ describe('MarketDataManager symbolLoadFailed', () => {
     vi.useRealTimers();
   });
 
-  it('emits symbolLoadFailed when an on-demand load returns no klines', async () => {
+  it('emits symbolLoadFailed and resolves noHistory when an on-demand load returns no klines', async () => {
     vi.useFakeTimers();
     const manager = makeManager(['BTCUSDT'], async () => []);
     const failedSpy = vi.fn();
@@ -57,15 +57,15 @@ describe('MarketDataManager symbolLoadFailed', () => {
 
     const loadPromise = manager.ensureSymbolLoaded('BTCUSDT');
     await vi.advanceTimersByTimeAsync(1100);
-    const result = await loadPromise;
+    const outcome = await loadPromise;
 
-    expect(result).toBe(false);
+    expect(outcome).toBe('noHistory');
     expect(failedSpy).toHaveBeenCalledWith('BTCUSDT');
 
     await manager.shutdown();
   });
 
-  it('emits symbolLoadFailed when an on-demand fetch throws', async () => {
+  it('emits symbolLoadFailed and rejects when an on-demand fetch throws', async () => {
     vi.useFakeTimers();
     const manager = makeManager(['BTCUSDT'], async () => {
       throw new Error('boom');
@@ -74,10 +74,10 @@ describe('MarketDataManager symbolLoadFailed', () => {
     manager.on('symbolLoadFailed', failedSpy);
 
     const loadPromise = manager.ensureSymbolLoaded('BTCUSDT');
+    const rejection = expect(loadPromise).rejects.toThrow();
     await vi.advanceTimersByTimeAsync(1100);
-    const result = await loadPromise;
+    await rejection;
 
-    expect(result).toBe(false);
     expect(failedSpy).toHaveBeenCalledWith('BTCUSDT');
 
     await manager.shutdown();

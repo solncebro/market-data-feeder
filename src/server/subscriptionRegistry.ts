@@ -1,5 +1,5 @@
 import type { KlineInterval } from '../domain/marketData.types.js';
-import type { ManagedSource, RegistrationStatus, SubscribeArgs, SubscriptionRegistryArgs } from './subscriptionRegistry.types.js';
+import type { ManagedSource, RegistrationStatus, SubscribeArgs, SubscriptionRegistryArgs, SymbolLoadOutcome } from './subscriptionRegistry.types.js';
 
 const DEFAULT_TEARDOWN_DELAY_MS = 30_000;
 
@@ -9,7 +9,7 @@ interface IntervalRegistration<TSource extends ManagedSource> {
   allLoadPromise: Promise<void> | null;
   allSubscriberCount: number;
   symbolRefCountBySymbol: Map<string, number>;
-  symbolLoadPromiseBySymbol: Map<string, Promise<boolean>>;
+  symbolLoadPromiseBySymbol: Map<string, Promise<SymbolLoadOutcome>>;
 }
 
 class SubscriptionRegistry<TSource extends ManagedSource> {
@@ -39,6 +39,11 @@ class SubscriptionRegistry<TSource extends ManagedSource> {
 
         throw error;
       }
+
+      // The subscriber may have disconnected while the bulk load was in flight — its unsubscribe
+      // saw the load pending and deferred the teardown to this continuation (event-driven re-check;
+      // the load itself is what blocks teardownIfIdle below while allLoadPromise is set).
+      await this.teardownIfIdle(args.interval, registration);
 
       return registration.source;
     }
@@ -249,6 +254,13 @@ class SubscriptionRegistry<TSource extends ManagedSource> {
       return;
     }
 
+    // An in-flight bulk load must finish before the source may be torn down — shutting the source
+    // down mid-load would let the load's tail subscribe orphaned exchange streams on a dead source.
+    // The load continuation in subscribe() re-checks idleness once the load settles.
+    if (registration.allLoadPromise !== null) {
+      return;
+    }
+
     if (this.teardownDelayMs <= 0) {
       await this.performTeardown(interval, registration);
 
@@ -262,7 +274,7 @@ class SubscriptionRegistry<TSource extends ManagedSource> {
 
       const current = this.registrationByInterval.get(interval);
 
-      if (current !== registration || current.allSubscriberCount > 0 || current.symbolRefCountBySymbol.size > 0) {
+      if (current !== registration || current.allSubscriberCount > 0 || current.symbolRefCountBySymbol.size > 0 || current.allLoadPromise !== null) {
         return;
       }
 

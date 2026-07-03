@@ -22,4 +22,17 @@ describe('createTelegramControlBot', () => {
       onReboot: async () => undefined,
     })).toThrow();
   });
+
+  it('stop resolves even when polling never started (Telegraf throws "Bot is not running!")', async () => {
+    const bot = createTelegramControlBot({
+      botToken: 'test-token',
+      allowedChatIdList: ['1'],
+      statusProvider,
+      exchangeName: 'bybit',
+      logger: noopLogger,
+      onReboot: async () => undefined,
+    });
+
+    await expect(bot.stop()).resolves.toBeUndefined();
+  });
 });

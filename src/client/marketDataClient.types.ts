@@ -10,6 +10,9 @@ interface MarketDataClientArgs {
   events: FeedEventName[];
   wantMa: boolean;
   logger: WebSocketLogger;
+  // Test seams — production uses the built-in constants.
+  staleThresholdMs?: number;
+  staleCheckIntervalMs?: number;
 }
 
 export type { MarketDataClientArgs };

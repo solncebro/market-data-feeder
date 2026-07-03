@@ -1,8 +1,19 @@
+import { ExchangeNameEnum } from '@solncebro/trade-engine';
+
 import type { KlineInterval } from './marketData.types.js';
 
 const KLINE_BUFFER_SIZE = 499;
 const DEFAULT_INTERVAL_MS = 1_800_000;
 const STALENESS_THRESHOLD_MULTIPLIER = 2;
+
+// Backfill request rate is per-exchange because the two exchanges enforce REST limits differently.
+// Binance USD-M futures uses a per-IP weight budget: REQUEST_WEIGHT 2400/min (live fapi/v1/exchangeInfo),
+// and a klines call at limit=499 costs weight 2 -> the hard ceiling is 2400/60/2 = 20 req/s. We run 16
+// (16*2*60 = 1920 weight/min) to leave headroom for the 30s ticker poll (~160/min), exchangeInfo and
+// watchdog refetches that share the same per-IP budget. Bybit uses per-endpoint IP limits (not a weight
+// budget), where the proven value is 80 req/s.
+const KLINE_BACKFILL_REQUESTS_PER_SECOND_BINANCE = 16;
+const KLINE_BACKFILL_REQUESTS_PER_SECOND_BYBIT = 80;
 
 const INTERVAL_MS_BY_KEY: Record<KlineInterval, number> = {
   '1s': 1_000,
@@ -26,8 +37,14 @@ function resolveIntervalMs(interval: KlineInterval): number {
   return INTERVAL_MS_BY_KEY[interval] ?? DEFAULT_INTERVAL_MS;
 }
 
+function resolveBackfillRequestsPerSecond(exchangeName: ExchangeNameEnum): number {
+  return exchangeName === ExchangeNameEnum.Binance
+    ? KLINE_BACKFILL_REQUESTS_PER_SECOND_BINANCE
+    : KLINE_BACKFILL_REQUESTS_PER_SECOND_BYBIT;
+}
+
 function isKnownInterval(value: string): value is KlineInterval {
   return Object.prototype.hasOwnProperty.call(INTERVAL_MS_BY_KEY, value);
 }
 
-export { KLINE_BUFFER_SIZE, STALENESS_THRESHOLD_MULTIPLIER, isKnownInterval, resolveIntervalMs };
+export { KLINE_BUFFER_SIZE, STALENESS_THRESHOLD_MULTIPLIER, isKnownInterval, resolveIntervalMs, resolveBackfillRequestsPerSecond };

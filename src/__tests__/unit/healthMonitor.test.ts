@@ -270,4 +270,94 @@ describe('createHealthMonitor', () => {
 
     expect(isDone).toBe(true);
   });
+
+  it('a later degradation gets its FULL grace even when an earlier one cleared (per-key deadlines)', async () => {
+    const { monitor, onRestart } = makeMonitor();
+
+    monitor.report({ kind: 'streamSilent', interval: '30m', silenceMs: 50_000 });
+    await vi.advanceTimersByTimeAsync(60_000);
+    monitor.report({ kind: 'sourceMassStale', interval: '5m', staleCount: 100, symbolCount: 200 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    monitor.report({ kind: 'streamResumed', interval: '30m', silenceMs: 80_000 });
+
+    // The first degradation's deadline (90s from t0) passes — the second one is only 30s old.
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(onRestart).not.toHaveBeenCalled();
+
+    // The second degradation's own 90s grace elapses.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(onRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it('repeated critical transport messages do not push the escalation deadline forward', async () => {
+    const { monitor, onRestart } = makeMonitor();
+
+    monitor.report({ kind: 'transportNotify', message: 'CRITICAL failure one' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    monitor.report({ kind: 'transportNotify', message: 'CRITICAL failure two' });
+
+    // The deadline still counts from the FIRST report.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(onRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps re-checking after the loop guard blocked a restart and restarts once the guard allows', async () => {
+    let isRestartAllowed = false;
+    const restartGuard: RestartGuard = {
+      canRestart: () => isRestartAllowed,
+      recordRestart: vi.fn(),
+      getRecentRestartCount: () => 0,
+    };
+    const onRestart = vi.fn();
+    const monitor = createHealthMonitor({ config: SILENT_CONFIG, sendAlert: vi.fn(), restartGuard, onRestart, logger: noopLogger });
+
+    monitor.report({ kind: 'streamSilent', interval: '30m', silenceMs: 50_000 });
+    await vi.advanceTimersByTimeAsync(95_000);
+    expect(onRestart).not.toHaveBeenCalled();
+
+    // The window rolls over and the guard allows again — the still-active degradation must restart
+    // without any new triggering event.
+    isRestartAllowed = true;
+    await vi.advanceTimersByTimeAsync(95_000);
+    expect(onRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it('a delisted symbol is scrubbed from the digest bookkeeping (no eternal "still unrecovered")', async () => {
+    const { monitor, alertList } = makeMonitor();
+
+    monitor.report({ kind: 'klineStreamRecoveryFailed', interval: '5m', symbol: 'DEADUSDT', consecutiveFailCount: 3 });
+    await vi.advanceTimersByTimeAsync(3000);
+
+    monitor.report({ kind: 'symbolDelisted', interval: '5m', symbol: 'DEADUSDT' });
+    await vi.advanceTimersByTimeAsync(1_800_000);
+
+    const digestMessage = alertList[alertList.length - 1];
+    expect(digestMessage).not.toContain('DEADUSDT');
+    expect(digestMessage).toContain('✅');
+  });
+
+  it('an interval teardown clears its whole-source degradation (no spurious restart of a healthy feeder)', async () => {
+    const { monitor, onRestart } = makeMonitor();
+
+    monitor.report({ kind: 'streamSilent', interval: '30m', silenceMs: 50_000 });
+    // The last client left and the interval was torn down — streamResumed will never come.
+    monitor.report({ kind: 'intervalReleased', interval: '30m' });
+
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(onRestart).not.toHaveBeenCalled();
+  });
+
+  it('an interval teardown scrubs its symbols from the digest bookkeeping', async () => {
+    const { monitor, alertList } = makeMonitor();
+
+    monitor.report({ kind: 'klineStreamRecoveryFailed', interval: '5m', symbol: 'AAAUSDT', consecutiveFailCount: 3 });
+    await vi.advanceTimersByTimeAsync(3000);
+
+    monitor.report({ kind: 'intervalReleased', interval: '5m' });
+    await vi.advanceTimersByTimeAsync(1_800_000);
+
+    const digestMessage = alertList[alertList.length - 1];
+    expect(digestMessage).not.toContain('AAAUSDT');
+    expect(digestMessage).toContain('✅');
+  });
 });

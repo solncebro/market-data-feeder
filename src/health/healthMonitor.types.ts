@@ -17,7 +17,10 @@ type HealthEvent =
   | { kind: 'intervalLoadStarted'; interval: KlineInterval; symbolCount: number }
   | { kind: 'intervalLoadCompleted'; interval: KlineInterval; symbolCount: number }
   | { kind: 'symbolLoadCompleted'; interval: KlineInterval; symbol: string }
-  | { kind: 'symbolLoadFailed'; interval: KlineInterval; symbol: string };
+  | { kind: 'symbolLoadFailed'; interval: KlineInterval; symbol: string }
+  | { kind: 'symbolSyncAnomaly'; interval: KlineInterval; deferredCount: number; symbolCount: number }
+  | { kind: 'symbolDelisted'; interval: KlineInterval; symbol: string }
+  | { kind: 'intervalReleased'; interval: KlineInterval };
 
 interface HealthMonitorConfig {
   alertDedupMs: number;

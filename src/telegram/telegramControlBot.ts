@@ -19,6 +19,7 @@ import { MenuStep } from './menu.types.js';
 import type { CallbackData } from './menu.types.js';
 import { startChannelConnectivityMonitor } from './channelConnectivityMonitor.js';
 import type { ChannelConnectivityMonitor } from './channelConnectivityMonitor.js';
+import { createResilientStarter } from '../utils/resilientStarter.js';
 import type { InputAction, TelegramControlBot, TelegramControlBotArgs } from './telegramControlBot.types.js';
 
 const BENIGN_EDIT_ERROR_MARKER_LIST = [
@@ -38,6 +39,7 @@ const BOT_NAME = 'market-data-feeder';
 const STALE_SYMBOL_DISPLAY_LIMIT = 15;
 const CHANNEL_PROBE_RETRY_MS = 15_000;
 const CHANNEL_PROBE_RECHECK_MS = 60_000;
+const BOT_START_RETRY_MS = 60_000;
 
 const BUTTON_OVERVIEW = '🛰️ Overview';
 const BUTTON_WEBSOCKETS = '🔌 Websockets';
@@ -181,10 +183,16 @@ function createTelegramControlBot(args: TelegramControlBotArgs): TelegramControl
     allowedPeerList: allowedChatIdList,
     onLog: (message, payload) => logger.info(payload ?? {}, `[TelegramBot] ${message}`),
   });
+  // Late-bound: the resilient starter is created below, but launch failures (polling death) must be
+  // able to request a retry — createBot's onError is the only place they surface.
+  let requestBotRestart: (() => void) | null = null;
   const instance = registry.register({
     botToken,
     botName: BOT_NAME,
-    onError: (error) => logger.error({ error }, '[TelegramBot] bot crashed'),
+    onError: (error) => {
+      logger.error({ error }, '[TelegramBot] bot polling failed — a background relaunch will be scheduled');
+      requestBotRestart?.();
+    },
   });
 
   const sender = registry.createSender(BOT_NAME);
@@ -351,8 +359,11 @@ function createTelegramControlBot(args: TelegramControlBotArgs): TelegramControl
   };
 
   let connectivityMonitor: ChannelConnectivityMonitor | null = null;
+  let isHandlersRegistered = false;
+  let isCommandsRegistered = false;
+  let isBotStopped = false;
 
-  const start = async (): Promise<void> => {
+  const registerReplyHandlers = (): void => {
     instance.bot.start(guard(showMainMenu));
     instance.bot.hears(BUTTON_OVERVIEW, guard((context) => sendStep(context, MenuStep.Overview, {}, 'reply')));
     instance.bot.hears(BUTTON_WEBSOCKETS, guard((context) => sendStep(context, MenuStep.Websockets, {}, 'reply')));
@@ -360,48 +371,95 @@ function createTelegramControlBot(args: TelegramControlBotArgs): TelegramControl
     instance.bot.hears(BUTTON_SYMBOL, guard(promptSymbolLookup, true));
     instance.bot.hears(BUTTON_RESTART, guard(triggerRestart));
     instance.bot.hears(BUTTON_CLOSE, guard(closeMenu));
+  };
 
-    await registerBotCommands({
-      bot: instance.bot,
-      accessControl: registry.accessControl,
-      commandConfigList: [
-        {
-          command: 'menu',
-          description: 'Open the control menu',
-          handler: guard(showMainMenu),
-        },
-        {
-          command: 'status',
-          description: 'Show feeder status',
-          handler: guard(async (context) => {
-            await context.reply(escapeMarkdownV2WithFormatting(formatOverviewMessage(statusProvider.getStatus(), exchangeName)), { parse_mode: 'MarkdownV2' });
-          }),
-        },
-      ],
-      callbackQueryHandler,
-      messageHandler,
-      onError: (message, payload) => logger.error(payload ?? {}, `[TelegramBot] ${message}`),
-    });
+  // Network phase, retried in the background by the resilient starter. Safe to re-run: the command
+  // registration performs its network call (setMyCommands) BEFORE wiring any Telegraf middleware, so
+  // a rejected attempt wires nothing and the isCommandsRegistered flag guards the wired-once success.
+  const attemptNetworkStart = async (): Promise<void> => {
+    // A hung network attempt can settle AFTER stop() — it must not relaunch polling then.
+    if (isBotStopped) {
+      return;
+    }
 
+    if (!isCommandsRegistered) {
+      await registerBotCommands({
+        bot: instance.bot,
+        accessControl: registry.accessControl,
+        commandConfigList: [
+          {
+            command: 'menu',
+            description: 'Open the control menu',
+            handler: guard(showMainMenu),
+          },
+          {
+            command: 'status',
+            description: 'Show feeder status',
+            handler: guard(async (context) => {
+              await context.reply(escapeMarkdownV2WithFormatting(formatOverviewMessage(statusProvider.getStatus(), exchangeName)), { parse_mode: 'MarkdownV2' });
+            }),
+          },
+        ],
+        callbackQueryHandler,
+        messageHandler,
+        onError: (message, payload) => logger.error(payload ?? {}, `[TelegramBot] ${message}`),
+      });
+      isCommandsRegistered = true;
+    }
+
+    if (isBotStopped) {
+      return;
+    }
+
+    // Long-lived promise (resolves only when polling stops); launch failures surface via the
+    // registered onError above, which schedules a background relaunch.
     registry.launchAll().catch((error: unknown) => {
       logger.error({ error }, '[TelegramBot] launch failed');
-    });
-
-    connectivityMonitor = startChannelConnectivityMonitor({
-      probe: async () => {
-        await instance.bot.telegram.getMe();
-      },
-      logger,
-      retryDelayMs: CHANNEL_PROBE_RETRY_MS,
-      recheckIntervalMs: CHANNEL_PROBE_RECHECK_MS,
     });
 
     logger.info({ allowedChatCount: allowedChatIdList.length }, '[TelegramBot] control bot launched');
   };
 
+  const starter = createResilientStarter({
+    attempt: attemptNetworkStart,
+    retryDelayMs: BOT_START_RETRY_MS,
+    label: 'telegram control bot',
+    logger,
+  });
+  requestBotRestart = () => starter.requestRetry();
+
+  const start = async (): Promise<void> => {
+    if (!isHandlersRegistered) {
+      registerReplyHandlers();
+      isHandlersRegistered = true;
+    }
+
+    if (connectivityMonitor === null) {
+      connectivityMonitor = startChannelConnectivityMonitor({
+        probe: async () => {
+          await instance.bot.telegram.getMe();
+        },
+        logger,
+        retryDelayMs: CHANNEL_PROBE_RETRY_MS,
+        recheckIntervalMs: CHANNEL_PROBE_RECHECK_MS,
+      });
+    }
+
+    // Never rejects: a Telegram outage must not take the feeder down with it.
+    await starter.start();
+  };
+
   const stop = async (): Promise<void> => {
+    isBotStopped = true;
+    starter.stop();
     connectivityMonitor?.stop();
-    await registry.stopAll('shutdown');
+    connectivityMonitor = null;
+
+    try {
+      await registry.stopAll('shutdown');
+    } catch (error: unknown) {
+      logger.warn({ error }, '[TelegramBot] stop skipped — polling was not running');
+    }
   };
 
   return { start, stop, sendAlert };

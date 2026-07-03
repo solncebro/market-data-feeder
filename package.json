@@ -15,9 +15,10 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "deploy:binance:leo": "yarn build && ssh root@209.38.110.21 'mkdir -p /opt/market-data-feeder-binance/' && rsync --archive --compress --delete --copy-unsafe-links .env.binance.leo dist package.json yarn.lock node_modules root@209.38.110.21:/opt/market-data-feeder-binance/ && ssh root@209.38.110.21 'cd /opt/market-data-feeder-binance && mv .env.binance.leo .env'",
     "deploy:binance": "yarn build && ssh root@82.26.198.214 'mkdir -p /opt/market-data-feeder-binance/' && rsync --archive --compress --delete .env.binance dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-binance/ && ssh root@82.26.198.214 'cd /opt/market-data-feeder-binance && mv .env.binance .env'",
     "deploy": "yarn build && ssh root@82.26.198.214 'mkdir -p /opt/market-data-feeder-bybit/' && rsync --archive --compress --delete .env.bybit dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-bybit/ && ssh root@82.26.198.214 'cd /opt/market-data-feeder-bybit && mv .env.bybit .env'",
-    "deploy:all": "yarn build && ssh root@82.26.198.214 'mkdir -p /opt/market-data-feeder-binance /opt/market-data-feeder-bybit' && rsync --archive --compress --delete .env.binance dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-binance/ && rsync --archive --compress --delete .env.bybit dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-bybit/ && ssh root@82.26.198.214 'cd /opt/market-data-feeder-binance && mv .env.binance .env && cd /opt/market-data-feeder-bybit && mv .env.bybit .env'"
+    "deploy:all": "yarn deploy && yarn deploy:binance && yarn deploy:binance:leo"
   },
   "dependencies": {
     "@solncebro/telegram-engine": "file:../telegram-engine",

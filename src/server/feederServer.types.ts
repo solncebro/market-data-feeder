@@ -19,6 +19,10 @@ interface FeederServerArgs {
   onHealthEvent?: (event: HealthEvent) => void;
   maxConnections?: number;
   maxPayloadBytes?: number;
+  subscribeFailureCloseDelayMs?: number;
+  heartbeatIntervalMs?: number;
+  maxMissedPongCount?: number;
+  slowClientBufferedLimitBytes?: number;
 }
 
 interface ForwardFeedMessageArgs {

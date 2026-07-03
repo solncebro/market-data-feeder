@@ -1,7 +1,8 @@
-import { ExchangeConnector, logger } from '@solncebro/trade-engine';
+import { ExchangeConnector, RateLimitedRequestQueue, logger } from '@solncebro/trade-engine';
 import { escapeMarkdownV2WithFormatting } from '@solncebro/telegram-engine';
 
 import type { KlineInterval } from './domain/marketData.types.js';
+import { resolveBackfillRequestsPerSecond } from './domain/constants.js';
 import type { FeederLogger } from './server/feederServer.types.js';
 import { loadEnvConfig } from './config/env.js';
 import { MarketDataManager } from './source/marketDataManager.js';
@@ -10,6 +11,7 @@ import { createRestartGuard } from './health/restartGuard.js';
 import { createHealthMonitor } from './health/healthMonitor.js';
 import { installCrashHandlers } from './health/crashHandlers.js';
 import { runWithHardExit } from './utils/hardExit.js';
+import { runShutdownStepsBestEffort } from './utils/shutdownSteps.js';
 import { createTelegramControlBot } from './telegram/telegramControlBot.js';
 
 const HEALTH_ALERT_DEDUP_MS = 300_000;
@@ -57,15 +59,31 @@ async function main(): Promise<void> {
     logger: feederLogger,
   });
 
+  // First caller wins, including its exit code: a concurrent escalation restart and an operator
+  // SIGTERM must not run two overlapping teardown sequences.
+  let isShuttingDown = false;
+
   const shutdown = async (reason?: string, exitCode: number = 0): Promise<void> => {
+    if (isShuttingDown) {
+      return;
+    }
+
+    isShuttingDown = true;
     logger.info({ reason, exitCode }, '[Feeder] Shutting down');
 
     await runWithHardExit(
       async () => {
-        await healthMonitor.shutdown();
-        await stopBot();
-        await server.shutdown();
-        await exchangeConnector.disconnect();
+        // Best-effort steps: a throwing step must not strand the process alive with the health
+        // monitor already stopped — process.exit below is reached no matter what.
+        await runShutdownStepsBestEffort(
+          [
+            { label: 'health monitor', run: () => healthMonitor.shutdown() },
+            { label: 'telegram bot', run: () => stopBot() },
+            { label: 'feeder server', run: () => server.shutdown() },
+            { label: 'exchange connector', run: () => exchangeConnector.disconnect() },
+          ],
+          (label, error) => logger.error({ error }, `[Feeder] shutdown step failed: ${label} (continuing)`),
+        );
       },
       SHUTDOWN_HARD_EXIT_MS,
       () => {
@@ -111,11 +129,19 @@ async function main(): Promise<void> {
 
   await exchangeConnector.initialize();
 
+  // One process-wide backfill pacer shared by every interval source, tuned to the exchange's REST
+  // limits (Binance has a per-IP weight budget that 80 req/s would blow past — see resolveBackfillRequestsPerSecond).
+  const backfillQueue = new RateLimitedRequestQueue({
+    rateLimit: resolveBackfillRequestsPerSecond(envConfig.exchangeName),
+    intervalMs: 1000,
+    loggerLabel: '[MarketData:backfill]',
+  });
+
   const server = new FeederServer({
     port: envConfig.port,
     host: envConfig.host,
     logger: feederLogger,
-    createSource: (interval: KlineInterval) => new MarketDataManager(exchangeConnector, interval),
+    createSource: (interval: KlineInterval) => new MarketDataManager(exchangeConnector, interval, backfillQueue),
     onHealthEvent: (event) => healthMonitor.report(event),
   });
 
@@ -135,7 +161,13 @@ async function main(): Promise<void> {
   stopBot = controlBot.stop;
   sendAlert = controlBot.sendAlert;
 
-  await controlBot.start();
+  // The bot start is non-fatal by design (it retries in the background), and this belt-and-braces
+  // catch guarantees a Telegram outage can never crash-loop the feeder at startup.
+  try {
+    await controlBot.start();
+  } catch (error: unknown) {
+    logger.error({ error }, '[Feeder] control bot start failed — feeder continues without Telegram until it recovers');
+  }
 
   const readyStatus = server.getStatus();
   healthMonitor.report({ kind: 'feederReady', exchangeName: envConfig.exchangeName, host: readyStatus.host, port: readyStatus.port });

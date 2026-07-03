@@ -7,10 +7,24 @@ import type { EnvConfig } from './env.types.js';
 const DEFAULT_PORT = 7070;
 const DEFAULT_HOST = '127.0.0.1';
 
-function requireEnv(name: string): string {
-  const value = process.env[name];
+// Values are trimmed and whitespace-only counts as missing: a trailing space smuggled in by a shell
+// or a systemd unit (e.g. in EXCHANGE_NAME) must not fail validation with a confusing message.
+function readEnv(name: string): string | undefined {
+  const raw = process.env[name];
 
-  if (value === undefined || value === '') {
+  if (raw === undefined) {
+    return undefined;
+  }
+
+  const trimmed = raw.trim();
+
+  return trimmed === '' ? undefined : trimmed;
+}
+
+function requireEnv(name: string): string {
+  const value = readEnv(name);
+
+  if (value === undefined) {
     throw new Error(`Missing required env var: ${name}`);
   }
 
@@ -30,9 +44,9 @@ function resolveExchangeName(raw: string): ExchangeNameEnum {
 }
 
 function resolvePort(): number {
-  const raw = process.env.MARKET_DATA_FEEDER_PORT;
+  const raw = readEnv('MARKET_DATA_FEEDER_PORT');
 
-  if (raw === undefined || raw === '') {
+  if (raw === undefined) {
     return DEFAULT_PORT;
   }
 
@@ -65,7 +79,7 @@ function loadEnvConfig(): EnvConfig {
     exchangeApiKey: requireEnv('EXCHANGE_API_KEY'),
     exchangeSecret: requireEnv('EXCHANGE_SECRET'),
     port: resolvePort(),
-    host: process.env.MARKET_DATA_FEEDER_HOST ?? DEFAULT_HOST,
+    host: readEnv('MARKET_DATA_FEEDER_HOST') ?? DEFAULT_HOST,
     telegramBotToken: requireEnv('TELEGRAM_BOT_TOKEN'),
     telegramAllowedChatIdList: resolveAllowedChatIdList(),
   };

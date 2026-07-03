@@ -76,4 +76,19 @@ describe('startChannelConnectivityMonitor', () => {
 
     expect(probe.mock.calls.length).toBe(callCountAfterStop);
   });
+
+  it('a probe that never settles is treated as a failure after the timeout (the monitor never dies silently)', async () => {
+    const probe = vi.fn(() => new Promise<void>(() => undefined));
+    const logger = makeLogger();
+    const monitor = startChannelConnectivityMonitor({ probe, logger, retryDelayMs: RETRY_MS, recheckIntervalMs: RECHECK_MS, probeTimeoutMs: 10_000 });
+
+    await vi.advanceTimersByTimeAsync(10_001);
+    expect(logger.error).toHaveBeenCalledTimes(1);
+
+    // The retry cycle keeps going despite the hung probe.
+    await vi.advanceTimersByTimeAsync(RETRY_MS + 10_001);
+    expect(probe.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+    monitor.stop();
+  });
 });
