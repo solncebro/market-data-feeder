@@ -435,6 +435,10 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     this.isShutDown = true;
     const exchangeClient = this.exchangeConnector.futures;
 
+    // Snapshot the footprint before the cleanup so the teardown log reports what was actually freed.
+    const releasedSymbolCount = this.klineListBySymbol.size;
+    const releasedKlineCount = this.getKlineCount();
+
     if (this.stalenessSchedulerHandle !== null) {
       this.stalenessSchedulerHandle.stop();
       this.stalenessSchedulerHandle = null;
@@ -458,10 +462,34 @@ class MarketDataManager extends EventEmitter implements FeederSource {
       }
     }
 
+    // Free every per-symbol buffer explicitly instead of trusting the whole instance to be
+    // garbage-collected: a backfill or gap-repair task still queued in the shared pacer keeps this
+    // source reachable through its closure, so without these clears the kline history (the heavy
+    // part — up to KLINE_BUFFER_SIZE candles per symbol) stays resident until that task drains.
     this.subscriptionBySymbol.clear();
     this.handlerBySymbol.clear();
+    this.klineListBySymbol.clear();
+    this.maValuesBySymbol.clear();
+    this.currentKlineBySymbol.clear();
+    this.lastEmittedUpdateBySymbol.clear();
+    this.consecutiveStaleScanCountBySymbol.clear();
+    this.persistentStaleEmittedSet.clear();
+    this.skippedOlderKlineCountBySymbol.clear();
+    this.lastEmittedVolumeBySymbol.clear();
+    this.lastGapRepairAtMsBySymbol.clear();
+    this.gapRepairInFlightSet.clear();
     this.gapRepairPendingSymbolList.length = 0;
     this.gapRepairFetchCountBySymbol.clear();
+    this.pendingRemovalSet = new Set();
+
+    // Drop the forwarding listeners the server attached (emit('sourceShutdown') above already ran
+    // synchronously) so nothing external pins this dead source in memory.
+    this.removeAllListeners();
+
+    logger.info(
+      { releasedSymbolCount, releasedKlineCount },
+      `[MarketData] Interval torn down — released ${releasedSymbolCount} symbols, ${releasedKlineCount} klines [${this.interval}]`,
+    );
   }
 
   private async fetchKlinesWithTimeout(fetchPromise: Promise<Kline[]>, timeoutMs: number, symbol: string): Promise<Kline[]> {

@@ -50,4 +50,31 @@ describe('MarketDataManager shutdown resilience', () => {
     await expect(manager.shutdown()).resolves.toBeUndefined();
     expect(unsubscribedSymbolList).toEqual(['BBBUSDT']);
   });
+
+  it('clears every per-symbol buffer on teardown so a torn-down interval frees its memory', async () => {
+    const futuresClient = {
+      fetchKlines: vi.fn(async () => [makeKline(0), makeKline(1_800_000)]),
+      subscribeKlines: vi.fn(),
+      unsubscribeKlines: vi.fn(),
+    };
+    const connector = {
+      getFuturesSymbols: vi.fn(async () => ['AAAUSDT', 'BBBUSDT']),
+      getTicker: vi.fn(() => undefined),
+      get futures() {
+        return futuresClient;
+      },
+    } as unknown as ExchangeConnector;
+    const manager = new MarketDataManager(connector, '30m', new RateLimitedRequestQueue({ rateLimit: 1000, intervalMs: 1000 }));
+
+    await manager.loadAllSymbols();
+    expect(manager.getSymbolList()).toHaveLength(2);
+    expect(manager.getKlineCount()).toBeGreaterThan(0);
+
+    await manager.shutdown();
+
+    expect(manager.getSymbolList()).toEqual([]);
+    expect(manager.getKlineCount()).toBe(0);
+    expect(manager.getMaValues('AAAUSDT')).toEqual({ ma25: 0, ma50: 0, ma100: 0, ma200: 0 });
+    expect(futuresClient.unsubscribeKlines).toHaveBeenCalledTimes(2);
+  });
 });
