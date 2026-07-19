@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 
-import { MarketTypeEnum, RateLimitedRequestQueue, logger } from '@solncebro/trade-engine';
+import { MarketTypeEnum, RateLimitedRequestQueue, TradifiSymbolGate, logger } from '@solncebro/trade-engine';
 import type { ExchangeConnector, Kline, SubscribeKlinesArgs } from '@solncebro/trade-engine';
 
 import type { KlineInterval, MaValues, StaleSymbolInfo } from '../domain/marketData.types.js';
@@ -63,6 +63,7 @@ export function markBackfilledHistoryClosed(klineList: Kline[]): void {
 
 class MarketDataManager extends EventEmitter implements FeederSource {
   private readonly exchangeConnector: ExchangeConnector;
+  private readonly tradifiSymbolGate: TradifiSymbolGate;
   private readonly interval: KlineInterval;
   private readonly klineListBySymbol: Map<string, Kline[]> = new Map();
   private readonly maValuesBySymbol: Map<string, MaValues> = new Map();
@@ -95,6 +96,7 @@ class MarketDataManager extends EventEmitter implements FeederSource {
   constructor(exchangeConnector: ExchangeConnector, interval: KlineInterval, backfillQueue: RateLimitedRequestQueue = DEFAULT_BACKFILL_QUEUE) {
     super();
     this.exchangeConnector = exchangeConnector;
+    this.tradifiSymbolGate = new TradifiSymbolGate({ connector: exchangeConnector });
     this.interval = interval;
     this.backfillQueue = backfillQueue;
   }
@@ -106,7 +108,7 @@ class MarketDataManager extends EventEmitter implements FeederSource {
   }
 
   async loadAllSymbols(): Promise<void> {
-    const allSymbolList = await this.exchangeConnector.getFuturesSymbols({ excludeTradifi: true });
+    const allSymbolList = await this.tradifiSymbolGate.loadUniverse();
 
     // Teardown can land at any await of this method (the registry defers it until the load settles,
     // but the source may also be shut down directly) — from here on every stage bails out on
@@ -247,7 +249,7 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     }
 
     const exchangeClient = this.exchangeConnector.futures;
-    const exchangeSymbolList = await this.exchangeConnector.getFuturesSymbols({ excludeTradifi: true });
+    const exchangeSymbolList = await this.tradifiSymbolGate.loadUniverse();
 
     // A non-empty exchange list that lacks the symbol = legit absence (delisted / never listed / a
     // typo that passed the boundary pattern) — an empty snapshot is the correct answer, not an
@@ -353,12 +355,9 @@ class MarketDataManager extends EventEmitter implements FeederSource {
 
   async syncAllSymbols(): Promise<void> {
     try {
-      // getFuturesSymbols reads an in-memory cache that otherwise loads once at initialize() —
-      // without this refresh the hourly sync compares the cached list against itself and can never
-      // see a listing or delisting.
-      await this.exchangeConnector.refreshFuturesTradeSymbols();
-
-      const allSymbolList = await this.exchangeConnector.getFuturesSymbols({ excludeTradifi: true });
+      // reloadUniverse refreshes the exchange symbol cache first — without it the hourly sync
+      // compares the cached list against itself and can never see a listing or delisting.
+      const allSymbolList = await this.tradifiSymbolGate.reloadUniverse();
       const usdtSymbolList = allSymbolList.filter((symbol) => symbol.endsWith('USDT'));
 
       if (usdtSymbolList.length === 0) {
