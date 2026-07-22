@@ -356,6 +356,14 @@ class FeederServer {
       this.emitHealthEvent({ kind: 'symbolLoadFailed', interval, symbol });
     });
 
+    source.on('symbolBackfillStuck', (symbol) => {
+      this.emitHealthEvent({ kind: 'symbolBackfillStuck', interval, symbol });
+    });
+
+    source.on('symbolBackfillRecovered', (symbol) => {
+      this.emitHealthEvent({ kind: 'symbolBackfillRecovered', interval, symbol });
+    });
+
     return source;
   }
 

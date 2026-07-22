@@ -18,6 +18,8 @@ type HealthEvent =
   | { kind: 'intervalLoadCompleted'; interval: KlineInterval; symbolCount: number }
   | { kind: 'symbolLoadCompleted'; interval: KlineInterval; symbol: string }
   | { kind: 'symbolLoadFailed'; interval: KlineInterval; symbol: string }
+  | { kind: 'symbolBackfillStuck'; interval: KlineInterval; symbol: string }
+  | { kind: 'symbolBackfillRecovered'; interval: KlineInterval; symbol: string }
   | { kind: 'symbolSyncAnomaly'; interval: KlineInterval; deferredCount: number; symbolCount: number }
   | { kind: 'symbolDelisted'; interval: KlineInterval; symbol: string }
   | { kind: 'intervalReleased'; interval: KlineInterval };

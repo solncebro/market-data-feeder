@@ -68,6 +68,9 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
   const windowDegradedKeySet = new Set<string>();
   const windowRecoveredKeySet = new Set<string>();
   const unrecoveredByKey = new Map<string, SymbolEntry>();
+  // Symbols whose history is incomplete and whose backfill has converged (the exchange serves no
+  // more) — listed by name in the periodic digest until they recover, never an immediate alert.
+  const stuckBackfillByKey = new Map<string, SymbolEntry>();
 
   const emitAlert = (message: string): void => {
     const sendPromise = Promise.resolve(sendAlert(escapeMarkdownV2WithFormatting(message))).catch((error: unknown) => {
@@ -134,7 +137,7 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
   };
 
   const emitDigest = (): void => {
-    if (windowDegradedKeySet.size === 0 && windowRecoveredKeySet.size === 0 && unrecoveredByKey.size === 0) {
+    if (windowDegradedKeySet.size === 0 && windowRecoveredKeySet.size === 0 && unrecoveredByKey.size === 0 && stuckBackfillByKey.size === 0) {
       emitAlert('✅ Kline streams healthy — no issues since the last report.');
 
       return;
@@ -145,6 +148,11 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
     if (unrecoveredByKey.size > 0) {
       lineList.push('');
       lineList.push(buildGroupedSymbolMessage(`🛑 Still unrecovered (${unrecoveredByKey.size}):`, Array.from(unrecoveredByKey.values())));
+    }
+
+    if (stuckBackfillByKey.size > 0) {
+      lineList.push('');
+      lineList.push(buildGroupedSymbolMessage(`🕳️ Still under-filled (${stuckBackfillByKey.size}):`, Array.from(stuckBackfillByKey.values())));
     }
 
     emitAlert(lineList.join('\n'));
@@ -330,6 +338,7 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
         windowRecoveredKeySet.delete(key);
         unrecoveredByKey.delete(key);
         pendingRecoveryFailedByKey.delete(key);
+        stuckBackfillByKey.delete(key);
 
         return;
       }
@@ -368,6 +377,12 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
           }
         }
 
+        for (const key of Array.from(stuckBackfillByKey.keys())) {
+          if (key.startsWith(keyPrefix)) {
+            stuckBackfillByKey.delete(key);
+          }
+        }
+
         return;
       }
 
@@ -382,6 +397,24 @@ function createHealthMonitor(args: HealthMonitorArgs): HealthMonitor {
         windowDegradedKeySet.add(`${event.interval}:${event.symbol}`);
 
         return;
+
+      case 'symbolBackfillStuck': {
+        // Not an immediate alert and never escalating: the data still flows (with a short buffer).
+        // The symbol is listed by name in the periodic digest until its history fills in.
+        const key = `${event.interval}:${event.symbol}`;
+        windowDegradedKeySet.add(key);
+        stuckBackfillByKey.set(key, { interval: event.interval, symbol: event.symbol });
+
+        return;
+      }
+
+      case 'symbolBackfillRecovered': {
+        const key = `${event.interval}:${event.symbol}`;
+        windowRecoveredKeySet.add(key);
+        stuckBackfillByKey.delete(key);
+
+        return;
+      }
 
       default:
         return;

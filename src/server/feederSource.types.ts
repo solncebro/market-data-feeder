@@ -25,7 +25,7 @@ interface FeederSource extends ManagedSource {
   getPersistentStaleCount: () => number;
   on(eventName: 'klineClosed' | 'klineUpdated', listener: KlineWithMaListener): this;
   on(eventName: 'klineUpdatedTick', listener: KlineTickListener): this;
-  on(eventName: 'symbolAdded' | 'symbolRemoved' | 'symbolReseeded' | 'symbolReleased' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted' | 'symbolLoadFailed', listener: SymbolNameListener): this;
+  on(eventName: 'symbolAdded' | 'symbolRemoved' | 'symbolReseeded' | 'symbolReleased' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted' | 'symbolLoadFailed' | 'symbolBackfillStuck' | 'symbolBackfillRecovered', listener: SymbolNameListener): this;
   on(eventName: 'sourceShutdown', listener: SourceLifecycleListener): this;
   on(eventName: 'volume24h', listener: Volume24hListener): this;
   on(eventName: 'streamSilent' | 'streamResumed', listener: StreamSilenceListener): this;
@@ -34,7 +34,7 @@ interface FeederSource extends ManagedSource {
   on(eventName: 'intervalLoadStarted' | 'intervalLoadCompleted', listener: IntervalLoadListener): this;
   off(eventName: 'klineClosed' | 'klineUpdated', listener: KlineWithMaListener): this;
   off(eventName: 'klineUpdatedTick', listener: KlineTickListener): this;
-  off(eventName: 'symbolAdded' | 'symbolRemoved' | 'symbolReseeded' | 'symbolReleased' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted' | 'symbolLoadFailed', listener: SymbolNameListener): this;
+  off(eventName: 'symbolAdded' | 'symbolRemoved' | 'symbolReseeded' | 'symbolReleased' | 'persistentStaleSymbol' | 'persistentStaleRecovered' | 'symbolLoadCompleted' | 'symbolLoadFailed' | 'symbolBackfillStuck' | 'symbolBackfillRecovered', listener: SymbolNameListener): this;
   off(eventName: 'sourceShutdown', listener: SourceLifecycleListener): this;
   off(eventName: 'volume24h', listener: Volume24hListener): this;
   off(eventName: 'streamSilent' | 'streamResumed', listener: StreamSilenceListener): this;

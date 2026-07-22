@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 
 import { MarketTypeEnum, RateLimitedRequestQueue, TradifiSymbolGate, logger } from '@solncebro/trade-engine';
-import type { ExchangeConnector, Kline, SubscribeKlinesArgs } from '@solncebro/trade-engine';
+import type { ExchangeConnector, Kline, SubscribeKlinesArgs, TradeSymbolBySymbol } from '@solncebro/trade-engine';
 
 import type { KlineInterval, MaValues, StaleSymbolInfo } from '../domain/marketData.types.js';
 import { KLINE_BUFFER_SIZE, STALENESS_THRESHOLD_MULTIPLIER, resolveIntervalMs } from '../domain/constants.js';
@@ -39,6 +39,21 @@ const MASS_STALE_MIN_SYMBOLS = 20;
 const GAP_REPAIR_COOLDOWN_MS = 600_000;
 const MAX_CONCURRENT_GAP_REPAIRS = 3;
 const GAP_REPAIR_BASE_FETCH_COUNT = 2;
+
+// A symbol whose buffer sits far below the history its listing time implies (a truncated REST load —
+// the exchange momentarily served a few candles instead of the full window) is re-backfilled through
+// the gap-repair queue until it fills, without waiting for a full process restart. The tolerance
+// absorbs the newest forming/edge candles so a healthy, fully-loaded symbol is never flagged.
+const UNDERGROWN_TOLERANCE = 3;
+// A latched (converged) symbol is still re-probed at a slow cadence: the exchange's "no more
+// candles" answer may itself have been a persistent transient, and an hourly full-window probe
+// heals it within the hour instead of never.
+const CONVERGED_REPROBE_INTERVAL_MS = 3_600_000;
+// After this many CONSECUTIVE hourly re-probes reconfirm the convergence, the exchange's answer is
+// accepted as the symbol's true history start: a contract that started trading later than its
+// listing time is the norm (Bybit announces ~a day ahead), not an anomaly to alarm on for weeks —
+// the symbol leaves the digest and is measured from its own first candle from then on.
+const CONVERGED_ACCEPT_REPROBE_COUNT = 2;
 
 // Fallback pacer for the no-arg constructor (tests). Production injects an exchange-tuned queue from
 // feeder.ts (resolveBackfillRequestsPerSecond) — Binance must run slower than this to stay under its
@@ -86,6 +101,22 @@ class MarketDataManager extends EventEmitter implements FeederSource {
   private readonly gapRepairInFlightSet: Set<string> = new Set();
   private readonly gapRepairPendingSymbolList: string[] = [];
   private readonly gapRepairFetchCountBySymbol: Map<string, number> = new Map();
+  // Symbols whose backfill has converged — a refetch returned data but added nothing while the buffer
+  // is still below the expected size (the exchange genuinely serves fewer candles than the listing
+  // time implies, e.g. a contract announced long before its first candle). Re-scheduling stops until
+  // the buffer changes, so a symbol with a short real history does not retry forever.
+  private readonly backfillConvergedSet: Set<string> = new Set();
+  // First converged measurement (the pending vote). The latch requires TWO full-window convergences
+  // in a row: the incident this machinery exists for IS a transient full-window truncation, so a
+  // single measurement must never disable the backfill (mirrors the mass-removal
+  // confirm-on-second-sync guard). Any merge that adds data clears the vote.
+  private readonly pendingBackfillConvergeSet: Set<string> = new Set();
+  // Consecutive hourly re-probes that reconfirmed a latched convergence; at
+  // CONVERGED_ACCEPT_REPROBE_COUNT the short history is accepted as the exchange's truth.
+  private readonly convergedReprobeCountBySymbol: Map<string, number> = new Map();
+  // Exchange-confirmed history start (the oldest candle of a repeatedly reconfirmed short history).
+  // Overrides the listing time in the expectation so an accepted symbol reads healthy.
+  private readonly acceptedHistoryStartMsBySymbol: Map<string, number> = new Map();
   private locallyClosedCandleCount: number = 0;
   private stalenessSchedulerHandle: IntervalSchedulerHandle | null = null;
   private silenceSchedulerHandle: IntervalSchedulerHandle | null = null;
@@ -351,6 +382,10 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     this.lastEmittedVolumeBySymbol.delete(symbol);
     this.lastGapRepairAtMsBySymbol.delete(symbol);
     this.gapRepairFetchCountBySymbol.delete(symbol);
+    this.backfillConvergedSet.delete(symbol);
+    this.pendingBackfillConvergeSet.delete(symbol);
+    this.convergedReprobeCountBySymbol.delete(symbol);
+    this.acceptedHistoryStartMsBySymbol.delete(symbol);
   }
 
   async syncAllSymbols(): Promise<void> {
@@ -479,6 +514,10 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     this.gapRepairInFlightSet.clear();
     this.gapRepairPendingSymbolList.length = 0;
     this.gapRepairFetchCountBySymbol.clear();
+    this.backfillConvergedSet.clear();
+    this.pendingBackfillConvergeSet.clear();
+    this.convergedReprobeCountBySymbol.clear();
+    this.acceptedHistoryStartMsBySymbol.clear();
     this.pendingRemovalSet = new Set();
 
     // Drop the forwarding listeners the server attached (emit('sourceShutdown') above already ran
@@ -793,13 +832,26 @@ class MarketDataManager extends EventEmitter implements FeederSource {
       const mergeResult = mergeRepairedKlines({ bufferKlineList, fetchedKlineList, formingOpenTimestamp, maxBufferSize: KLINE_BUFFER_SIZE });
 
       if (mergeResult.changedCount === 0) {
+        this.handleRepairConverged(symbol, bufferKlineList, fetchCount);
+
         return;
       }
+
+      // Data arrived — any pending convergence conclusion is stale. Dropping the converged flag
+      // resumes the scan's full backfills; "recovered" fires only when the history actually caught
+      // up (a partial merge must not read as a recovery in the operator digest).
+      this.pendingBackfillConvergeSet.delete(symbol);
+      this.convergedReprobeCountBySymbol.delete(symbol);
+      const wasConverged = this.backfillConvergedSet.delete(symbol);
 
       this.klineListBySymbol.set(symbol, mergeResult.mergedKlineList);
       this.recalculateAndStoreMa(symbol, mergeResult.mergedKlineList);
       logger.info({ symbol, changedCount: mergeResult.changedCount, fetchCount }, `[MarketData] ${symbol} gap repair merged ${mergeResult.changedCount} candle(s) — reseeding clients [${this.interval}]`);
       this.emit('symbolReseeded', symbol);
+
+      if (wasConverged && !this.isSymbolUndergrown(symbol, mergeResult.mergedKlineList)) {
+        this.emit('symbolBackfillRecovered', symbol);
+      }
     } catch (error: unknown) {
       logger.error({ symbol, error }, `[MarketData] ${symbol} gap repair failed — the hole stays until the next detection [${this.interval}]`);
       this.emit('symbolLoadFailed', symbol);
@@ -950,6 +1002,143 @@ class MarketDataManager extends EventEmitter implements FeederSource {
     }
 
     this.evaluateMassStale(staleCount);
+    this.scanUndergrownSymbols();
+  }
+
+  // A symbol whose buffer is far below the history its listing time implies (a truncated load that
+  // would otherwise stay broken until a full restart — `computeSymbolListDelta` never re-adds an
+  // already-loaded symbol) is re-backfilled through the shared gap-repair queue. Converged symbols
+  // are left alone until their buffer changes on its own (live stream), which clears the flag.
+  private scanUndergrownSymbols(): void {
+    for (const [symbol, klineList] of this.klineListBySymbol) {
+      const expectedCount = this.computeExpectedKlineCount(symbol);
+
+      // Unknown history anchor (the symbol momentarily absent from the trade-symbol cache after a
+      // flaky exchange list read): leave every state untouched — "unknown" must never read as
+      // "healthy" (a false recovery) nor as "broken" (a false backfill).
+      if (expectedCount === null) {
+        continue;
+      }
+
+      const isUndergrown = klineList.length + UNDERGROWN_TOLERANCE < expectedCount;
+
+      if (this.backfillConvergedSet.has(symbol)) {
+        if (!isUndergrown) {
+          this.backfillConvergedSet.delete(symbol);
+          this.convergedReprobeCountBySymbol.delete(symbol);
+          this.emit('symbolBackfillRecovered', symbol);
+
+          continue;
+        }
+
+        const lastRepairAtMs = this.lastGapRepairAtMsBySymbol.get(symbol) ?? 0;
+
+        if (Date.now() - lastRepairAtMs >= CONVERGED_REPROBE_INTERVAL_MS) {
+          this.scheduleGapRepair(symbol, KLINE_BUFFER_SIZE);
+        }
+
+        continue;
+      }
+
+      if (isUndergrown) {
+        this.scheduleGapRepair(symbol, KLINE_BUFFER_SIZE);
+      } else {
+        // Live growth caught the buffer up — a stale pending vote must not combine with a much
+        // later convergence into a premature latch.
+        this.pendingBackfillConvergeSet.delete(symbol);
+      }
+    }
+  }
+
+  // Expected candle count from the symbol's history anchor, capped at the buffer size. The anchor
+  // is the listing time, overridden by an exchange-confirmed (accepted) history start when the
+  // symbol's short history was repeatedly reconfirmed. Returns null when neither is known (never
+  // seen in production for Bybit/Binance, which always populate the listing time) — an unknown
+  // expectation must not flag a symbol, so the scan skips it.
+  private computeExpectedKlineCount(symbol: string): number | null {
+    const tradeSymbolBySymbol: TradeSymbolBySymbol | undefined = this.exchangeConnector.futures.tradeSymbols;
+    const launchTimestamp = tradeSymbolBySymbol?.get(symbol)?.launchTimestamp;
+    const isLaunchKnown = launchTimestamp !== undefined && Number.isFinite(launchTimestamp) && launchTimestamp > 0;
+    const acceptedStartMs = this.acceptedHistoryStartMsBySymbol.get(symbol);
+    let anchorMs = isLaunchKnown ? launchTimestamp : undefined;
+
+    if (acceptedStartMs !== undefined && (anchorMs === undefined || acceptedStartMs > anchorMs)) {
+      anchorMs = acceptedStartMs;
+    }
+
+    if (anchorMs === undefined) {
+      return null;
+    }
+
+    const elapsedMs = Date.now() - anchorMs;
+
+    if (elapsedMs <= 0) {
+      return 0;
+    }
+
+    return Math.min(KLINE_BUFFER_SIZE, Math.floor(elapsedMs / resolveIntervalMs(this.interval)));
+  }
+
+  private isSymbolUndergrown(symbol: string, klineList: Kline[]): boolean {
+    const expectedCount = this.computeExpectedKlineCount(symbol);
+
+    if (expectedCount === null) {
+      return false;
+    }
+
+    return klineList.length + UNDERGROWN_TOLERANCE < expectedCount;
+  }
+
+  // A repair fetched fresh data yet merged nothing. Only a FULL-window request may argue the
+  // exchange has nothing more (a 2-candle seal/hole repair returning known candles proves nothing
+  // about the missing depth), and even a full window must converge twice in a row before the latch.
+  private handleRepairConverged(symbol: string, bufferKlineList: Kline[], fetchCount: number): void {
+    if (fetchCount < KLINE_BUFFER_SIZE) {
+      return;
+    }
+
+    if (!this.isSymbolUndergrown(symbol, bufferKlineList)) {
+      this.pendingBackfillConvergeSet.delete(symbol);
+
+      return;
+    }
+
+    if (this.backfillConvergedSet.has(symbol)) {
+      this.recordConvergedReprobe(symbol, bufferKlineList);
+
+      return;
+    }
+
+    if (!this.pendingBackfillConvergeSet.has(symbol)) {
+      this.pendingBackfillConvergeSet.add(symbol);
+
+      return;
+    }
+
+    this.pendingBackfillConvergeSet.delete(symbol);
+    this.backfillConvergedSet.add(symbol);
+    logger.warn({ symbol, bufferSize: bufferKlineList.length }, `[MarketData] ${symbol} backfill converged below its expected history twice in a row — the exchange serves no more candles [${this.interval}]`);
+    this.emit('symbolBackfillStuck', symbol);
+  }
+
+  // An hourly re-probe of a latched symbol reconfirmed the convergence. After enough consecutive
+  // reconfirmations the short history is accepted as the exchange's truth: the expectation is
+  // re-anchored at the symbol's own first candle and the symbol leaves the digest.
+  private recordConvergedReprobe(symbol: string, bufferKlineList: Kline[]): void {
+    const reprobeCount = (this.convergedReprobeCountBySymbol.get(symbol) ?? 0) + 1;
+
+    if (reprobeCount < CONVERGED_ACCEPT_REPROBE_COUNT) {
+      this.convergedReprobeCountBySymbol.set(symbol, reprobeCount);
+
+      return;
+    }
+
+    const historyStartMs = bufferKlineList[0].openTimestamp;
+    this.acceptedHistoryStartMsBySymbol.set(symbol, historyStartMs);
+    this.backfillConvergedSet.delete(symbol);
+    this.convergedReprobeCountBySymbol.delete(symbol);
+    logger.info({ symbol, historyStartMs, bufferSize: bufferKlineList.length }, `[MarketData] ${symbol} short history accepted as the exchange's truth after ${CONVERGED_ACCEPT_REPROBE_COUNT} reconfirming re-probes — history starts at ${new Date(historyStartMs).toISOString()} [${this.interval}]`);
+    this.emit('symbolBackfillRecovered', symbol);
   }
 
   private evaluateMassStale(staleCount: number): void {

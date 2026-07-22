@@ -173,6 +173,60 @@ describe('createHealthMonitor', () => {
     expect(lastDigest).not.toContain('ZZZUSDT');
   });
 
+  it('lists an under-filled symbol in the digest by name until it recovers', async () => {
+    const { monitor, alertList } = makeMonitor({ digestIntervalMs: 5000 });
+
+    monitor.report({ kind: 'symbolBackfillStuck', interval: '30m', symbol: 'AEHRUSDT' });
+    await vi.advanceTimersByTimeAsync(5000);
+
+    const digest = alertList.find((message) => message.includes('AEHRUSDT'));
+    expect(digest).toBeDefined();
+    expect(digest).toMatch(/under.*filled/i);
+
+    monitor.report({ kind: 'symbolBackfillRecovered', interval: '30m', symbol: 'AEHRUSDT' });
+    await vi.advanceTimersByTimeAsync(5000);
+
+    const lastDigest = alertList[alertList.length - 1];
+    expect(lastDigest).not.toContain('AEHRUSDT');
+  });
+
+  it('keeps an under-filled symbol listed across digest windows with no further events', async () => {
+    const { monitor, alertList } = makeMonitor({ digestIntervalMs: 5000 });
+
+    monitor.report({ kind: 'symbolBackfillStuck', interval: '30m', symbol: 'AEHRUSDT' });
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(5000);
+
+    // The second digest window had no events at all — the symbol must still be listed by name
+    // (a window-set-style implementation that clears per digest would silently drop it).
+    const lastDigest = alertList[alertList.length - 1];
+    expect(lastDigest).toContain('AEHRUSDT');
+  });
+
+  it('an interval teardown scrubs its under-filled symbols from the digest', async () => {
+    const { monitor, alertList } = makeMonitor({ digestIntervalMs: 5000 });
+
+    monitor.report({ kind: 'symbolBackfillStuck', interval: '30m', symbol: 'AEHRUSDT' });
+    monitor.report({ kind: 'intervalReleased', interval: '30m' });
+    await vi.advanceTimersByTimeAsync(5000);
+
+    const lastDigest = alertList[alertList.length - 1];
+    expect(lastDigest).not.toContain('AEHRUSDT');
+    expect(lastDigest).toContain('✅');
+  });
+
+  it('scrubs an under-filled symbol from the digest when it is delisted', async () => {
+    const { monitor, alertList } = makeMonitor({ digestIntervalMs: 5000 });
+
+    monitor.report({ kind: 'symbolBackfillStuck', interval: '30m', symbol: 'GONEUSDT' });
+    monitor.report({ kind: 'symbolDelisted', interval: '30m', symbol: 'GONEUSDT' });
+    await vi.advanceTimersByTimeAsync(5000);
+
+    const lastDigest = alertList[alertList.length - 1];
+    expect(lastDigest).not.toContain('GONEUSDT');
+    expect(lastDigest).toContain('✅');
+  });
+
   it('reports all-healthy in the digest on a clean window', async () => {
     const { monitor, sendAlert, alertList } = makeMonitor({ digestIntervalMs: 5000 });
 
