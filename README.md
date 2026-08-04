@@ -2,19 +2,20 @@
 
 On-demand market-data feeder. One exchange connection per process fans klines, moving averages and 24h volume out to multiple strategy apps over a local WebSocket channel — so each strategy stops opening its own ~1200-symbol kline subscriptions.
 
-Two halves live in this package:
+Three consumption shapes live in this package:
 
 - **Server (feeder)** — `dist/feeder.js`. Holds a single `ExchangeConnector`, loads kline data **on demand** (an interval/symbol is fetched only when a client first asks for it, reference-counted, torn down when idle) and serves it to clients.
 - **Client (`MarketDataClient`)** — imported by strategy apps. Mirrors the feed in memory and exposes the same read API + events as the in-process market-data manager, so strategy code does not change. Transport reuses `@solncebro/websocket-engine` (auto-reconnect); data staleness is detected by the client itself and self-heals by re-creating the transport when staleness persists.
+- **Embedded source (`createEmbeddedMarketDataSource`)** — for a single-consumer app, runs the feeder core in-process (no WS hop, no second process). See "Embed in a single-consumer app" below.
 
 > **`isStale()` latency depends on the event set.** A subscription that includes `klineUpdated`/`klineUpdatedTick` receives data within seconds, so `isStale()` flips ~45s after data stops. A **closed-only** subscription legitimately gets one message per interval, so its threshold is `interval + 45s` (30m → ~31 min, 4h → ~4h1m) and the self-heal reconnect fires at twice that. If your app uses `isStale()` as a tight trade gate on a closed-only channel, add `klineUpdated` to the event set (or pass a lower `staleThresholdMs`).
 
 ## Run the feeder
 
 ```bash
-cp .env.example .env   # set EXCHANGE_NAME + a read-only API key
+cp .env.bybit.example .env   # or .env.binance.example — set the API key + Telegram bot token
 yarn install
-yarn dev               # or: yarn build && yarn start
+yarn dev                     # or: yarn build && yarn start
 ```
 
 One feeder process per exchange (mirrors the existing per-exchange deploy model).
@@ -23,7 +24,7 @@ One feeder process per exchange (mirrors the existing per-exchange deploy model)
 
 ```ts
 import { MarketDataClient } from '@solncebro/market-data-feeder';
-import type { IMarketDataSource } from '@solncebro/market-data-feeder';
+import type { MarketDataSource } from '@solncebro/market-data-feeder';
 
 const client = new MarketDataClient({
   url: 'ws://127.0.0.1:7070',
@@ -39,6 +40,28 @@ await client.waitUntilReady();
 ```
 
 Create one `MarketDataClient` per interval the app needs (e.g. the chaser app: 30m + 5m + 4h; the breaker and rubber: 30m only).
+
+## Embed in a single-consumer app
+
+When an app is the **only** market-data consumer on its machine, a separate feeder process just doubles the RAM (server buffer + client mirror hold the same klines). `createEmbeddedMarketDataSource` runs the feeder core in-process instead: same `MarketDataSource` read API + events served straight from the single kline store — no WS hop, no mirror, no second Node process, no Telegram/health-monitor stack.
+
+```ts
+import { createEmbeddedMarketDataSource } from '@solncebro/market-data-feeder';
+
+const source = await createEmbeddedMarketDataSource({
+  exchangeName: 'bybit',
+  exchangeApiKey,
+  exchangeSecret,
+  interval: '30m',
+  onNotify: (message) => notifier.sendMessage(message),
+});
+
+await source.waitUntilReady(180_000);
+// source.getKlineList / getVolume24h ... + source.on('klineClosed', ...)
+// on teardown: await source.shutdown()  (stops watchdogs, unsubscribes, closes its own connector)
+```
+
+The factory creates its **own** `ExchangeConnector` (kline watchdog tuned like the standalone feeder) so market-data traffic never shares a connector with the host's order path. Exchange-stream silence maps to `connectionLost`/`connectionRestored`, `isStale()` flips after 45s of silence, and the hourly listing/delisting sync runs inside the adapter. The standalone server topology is untouched — pick per machine: shared feeder process for many consumers, embedded core for one.
 
 ## Env
 

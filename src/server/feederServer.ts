@@ -6,7 +6,7 @@ import type { MarketDataSnapshotEntry } from '../domain/snapshot.types.js';
 import type { ServerMessage, SnapshotMessage, SubscribeMessage, SymbolAddedMessage, SymbolRemovedMessage, UnsubscribeMessage, Volume24hMessage } from '../protocol/messages.types.js';
 import { decodeMessage, encodeMessage } from '../protocol/codec.js';
 import { isValidSubscribe } from '../protocol/clientMessageValidation.js';
-import { isKnownInterval } from '../domain/constants.js';
+import { SYMBOL_LIST_SYNC_INTERVAL_MS, isKnownInterval } from '../domain/constants.js';
 import { SubscriptionRegistry } from './subscriptionRegistry.js';
 import type { HealthEvent } from '../health/healthMonitor.types.js';
 import type { FeederSource } from './feederSource.types.js';
@@ -14,7 +14,6 @@ import type { FeederLogger, FeederServerArgs, FeederStatus, ForwardFeedMessageAr
 
 const DEFAULT_SNAPSHOT_CHUNK_SIZE = 100;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const SYMBOL_LIST_SYNC_INTERVAL_MS = 3_600_000;
 const DEFAULT_MAX_CONNECTIONS = 64;
 const DEFAULT_MAX_PAYLOAD_BYTES = 262_144;
 // A failed subscribe closes the client socket so its ReliableWebSocket reconnects and re-sends the

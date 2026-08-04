@@ -8,9 +8,10 @@
 
 Deployment mirrors the existing per-symbol model: **one feeder process per exchange** (`binance` / `bybit`), with `EXCHANGE_NAME` selecting the exchange.
 
-Two halves of the package:
+Three consumption shapes in the package:
 - **Server (feeder)** — entry `src/feeder.ts` (`dist/feeder.js`). Holds the `ExchangeConnector`, loads data **on demand** and serves clients.
 - **Client (`MarketDataClient`)** — imported by apps from the barrel `src/index.ts`. Mirrors the stream in RAM and exposes the same read API + events as the in-process market-data manager, so strategy code does not change.
+- **Embedded source (`EmbeddedMarketDataSource`)** — the feeder core run in-process by a single-consumer app (no WS, no mirror, no second process). Same `MarketDataSource` contract as the client; see the section below.
 
 ## On-demand loading + ref-counting + deferred teardown (`SubscriptionRegistry`)
 
@@ -84,6 +85,18 @@ Server behavior:
 - `waitUntilReady(timeoutMs = 30_000)` resolves on the first `snapshot` with `isFinal: true` (or rejects on timeout). `isStale` is true until the final snapshot or if the last **data** message (any message except `heartbeat`) is older than the resolved threshold (`resolveDataStaleThresholdMs` in `dataStaleness.ts`): the base `CLIENT_STALE_THRESHOLD_MS = 45_000` for subscriptions with a high-frequency event (`klineUpdated`/`klineUpdatedTick`), and `intervalMs + base` for closed-only subscriptions (one message per interval is legit — the flat 45s made a healthy closed-only channel read stale most of every interval). Heartbeats are intentionally excluded so a live-but-stale connection is correctly detected. **Trade-off (documented for app owners):** on a closed-only channel `isStale()` reacts up to one interval late to a genuinely dead subscription; `volume24h` traffic usually masks this for liquid scopes, and a tight health gate should include `klineUpdated` in the event set. The pre-ready phase uses a larger self-heal floor (`CLIENT_PRE_READY_FORCE_RECONNECT_MS = 300_000`) so a cold-feeder bulk load (minutes on Binance) is never mistaken for a dead subscription.
 - **`connectionLost` / `connectionRestored`** events are emitted on `onNotify` from `ReliableWebSocket` and on the next snapshot completion, respectively. Apps can listen to react to feeder disconnects.
 - **`volume24h`** messages from the server are applied to the mirror store (`applyVolume24h`) so `getVolume24h` always returns the latest polled value.
+
+## Embedded source (`src/embedded/embeddedMarketDataSource.ts`)
+
+For a machine where ONE app is the only consumer, a separate feeder process doubles the RAM: the server buffer and the client mirror hold the same `KLINE_BUFFER_SIZE` klines per symbol, plus a second Node runtime and the WS/JSON hop. `createEmbeddedMarketDataSource({ exchangeName, exchangeApiKey, exchangeSecret, interval, onNotify? })` runs the core in-process instead: it builds its **own** `ExchangeConnector` (kline watchdog tuned with the same `KLINE_WATCHDOG_*` constants as `feeder.ts`, so market data never shares a connector with the host's order path), a dedicated `RateLimitedRequestQueue` (`resolveBackfillRequestsPerSecond`) and one `MarketDataManager`, and wraps them in `EmbeddedMarketDataSource` — a thin adapter implementing the client-side `MarketDataSource` contract:
+
+- Delegating read API + pass-through `klineClosed`/`klineUpdated`/`klineUpdatedTick`/`symbolAdded`/`symbolRemoved`.
+- `streamSilent` → `connectionLost(reason)`, `streamResumed` → `connectionRestored`: exchange-stream silence is the embedded counterpart of losing the feeder socket, so host-side guards (e.g. trade-engine's `FeederConnectionGuard`) work unchanged. `isStale()` reads `getStreamLiveness().isStreamSilent` (flips after `SILENCE_THRESHOLD_MS` = 45s — stricter than the client's closed-only `interval + 45s`).
+- `waitUntilReady(timeoutMs)` = `start()` + `loadAllSymbols()` under `withTimeout`, then arms the hourly `syncAllSymbols` scheduler (`SYMBOL_LIST_SYNC_INTERVAL_MS` — in the standalone process that timer lives in `FeederServer.startSymbolListSync`; without the adapter's own timer the embedded universe would freeze at its startup composition).
+- Whole-source degradations (`sourceMassStale`/`sourceMassStaleRecovered`/`symbolSyncAnomaly`) go to `onNotify`; per-symbol issues stay in the core's own logs (no health-monitor dedup/batching here, so per-symbol forwarding would spam the channel).
+- `shutdown()` (idempotent): stop the sync scheduler → `manager.shutdown()` → tear down its own connector.
+
+The standalone server topology is untouched — pick per machine: shared feeder process for many consumers, embedded core for one. First consumer: rubber (`MARKET_DATA_SOURCE=embedded`).
 
 ## Telegram control and monitoring bot (`src/telegram/`)
 
@@ -160,7 +173,7 @@ Wiring (`feeder.ts`): because of the dependency ring (bot→server→monitor, co
 Each app creates a `MarketDataClient` per interval it needs and switches its data flow to the feeder instead of its own subscriptions:
 - **ma-chaser** — 30m + 5m + 4h (source behind the `MARKET_DATA_SOURCE=feeder` / `MARKET_DATA_FEEDER_URL` flag; delisting handled via the `symbolRemoved` event).
 - **volume-breaker** — 30m.
-- **rubber** — 30m.
+- **rubber** — 30m; on a single-app machine it can instead run the core in-process via `createEmbeddedMarketDataSource` (`MARKET_DATA_SOURCE=embedded` on its side) — no feeder process needed there.
 
 One feeder process per exchange serves all apps of that exchange; they incrementally load only the intervals/symbols they need (ref-count + debounced teardown guarantee that unused intervals are released).
 
@@ -184,10 +197,12 @@ One feeder process per exchange serves all apps of that exchange; they increment
 ```
 src/
   feeder.ts                       # entry: ExchangeConnector + FeederServer + HealthMonitor + TelegramControlBot + graceful shutdown
-  index.ts                        # barrel: MarketDataClient + public types
+  index.ts                        # barrel: MarketDataClient + EmbeddedMarketDataSource/createEmbeddedMarketDataSource + public types
   config/env.ts + .types.ts       # EnvConfig + loadEnvConfig
   domain/
-    constants.ts                  # KLINE_BUFFER_SIZE, STALENESS_THRESHOLD_MULTIPLIER, resolveIntervalMs
+    constants.ts                  # KLINE_BUFFER_SIZE, STALENESS_THRESHOLD_MULTIPLIER, SYMBOL_LIST_SYNC_INTERVAL_MS, KLINE_WATCHDOG_*, resolveIntervalMs
+  embedded/
+    embeddedMarketDataSource.ts + .types.ts  # in-process adapter over MarketDataManager (see "Embedded source")
     marketData.types.ts           # Kline, KlineInterval, MaValues, StaleSymbolInfo
     events.types.ts               # source listener types
     snapshot.types.ts             # MarketDataSnapshotEntry
@@ -227,7 +242,7 @@ src/
     hardExit.ts                   # runWithHardExit (wraps async shutdown with a hard-timeout fallback)
     resilientStarter.ts           # createResilientStarter (never-fatal start with background retries — the Telegram bot)
     shutdownSteps.ts              # runShutdownStepsBestEffort (each teardown step try/caught individually)
-  __tests__/                      # vitest (codec, mirrorStore, subscriptionRegistry, symbolListDelta, statusFormatter, restartGuard, healthMonitor, streamSilence, feederChannel, massStale, dataStaleness, hardExit, crashHandlers, volumeRefresh, klineBackfillPacing, markBackfilledHistoryClosed, marketDataManagerMassStale, channelConnectivityMonitor, resilientStarter, shutdownSteps, sourceShutdownResilience, symbolRemovalGuard, symbolSyncRefresh, teardownDuringLoad, symbolLoadOutcome, gapRepairMerge, gapRepairManager, undergrownBackfill, doubleLoadRace, env, subscribeSelfHeal, subscriptionOwnership, slowClientProtection)
+  __tests__/                      # vitest (codec, mirrorStore, subscriptionRegistry, symbolListDelta, statusFormatter, restartGuard, healthMonitor, streamSilence, feederChannel, massStale, dataStaleness, hardExit, crashHandlers, volumeRefresh, klineBackfillPacing, markBackfilledHistoryClosed, marketDataManagerMassStale, channelConnectivityMonitor, resilientStarter, shutdownSteps, sourceShutdownResilience, symbolRemovalGuard, symbolSyncRefresh, teardownDuringLoad, symbolLoadOutcome, symbolLoadFailed, gapRepairMerge, gapRepairManager, undergrownBackfill, doubleLoadRace, env, subscribeSelfHeal, subscriptionOwnership, slowClientProtection, cryptoPerpsOnly, backfillRate, clientMessageValidation, telegramControlBotGuard, postShutdownGuard, embeddedMarketDataSource)
 ```
 
 ## Conventions

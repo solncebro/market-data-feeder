@@ -1,6 +1,6 @@
 {
   "name": "@solncebro/market-data-feeder",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "On-demand market-data feeder: one exchange connection, fans klines/MA/24h-volume out to multiple strategy apps over a local WebSocket channel",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -21,9 +21,9 @@
     "deploy:all": "yarn deploy && yarn deploy:binance && yarn deploy:binance:leo"
   },
   "dependencies": {
-    "@solncebro/telegram-engine": "file:../telegram-engine",
-    "@solncebro/trade-engine": "file:../trade-engine",
-    "@solncebro/websocket-engine": "file:../websocket-engine",
+    "@solncebro/telegram-engine": "^0.4.0",
+    "@solncebro/trade-engine": "^3.14.0",
+    "@solncebro/websocket-engine": "^0.4.0",
     "dotenv": "^16.4.5",
     "ws": "^8.18.0"
   },

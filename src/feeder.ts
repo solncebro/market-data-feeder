@@ -2,7 +2,7 @@ import { ExchangeConnector, RateLimitedRequestQueue, logger } from '@solncebro/t
 import { escapeMarkdownV2WithFormatting } from '@solncebro/telegram-engine';
 
 import type { KlineInterval } from './domain/marketData.types.js';
-import { resolveBackfillRequestsPerSecond } from './domain/constants.js';
+import { KLINE_WATCHDOG_GRACE_MS, KLINE_WATCHDOG_RECOVERY_COOLDOWN_MS, resolveBackfillRequestsPerSecond } from './domain/constants.js';
 import type { FeederLogger } from './server/feederServer.types.js';
 import { loadEnvConfig } from './config/env.js';
 import { MarketDataManager } from './source/marketDataManager.js';
@@ -22,8 +22,6 @@ const RESTART_WINDOW_MS = 30 * 60_000;
 const MAX_AUTO_RESTARTS = 3;
 const CRASH_ALERT_GRACE_MS = 3000;
 const SHUTDOWN_HARD_EXIT_MS = 15_000;
-const KLINE_WATCHDOG_GRACE_MS = 180_000;
-const KLINE_WATCHDOG_RECOVERY_COOLDOWN_MS = 300_000;
 // On-disk log of auto-restart moments — survives a process restart so the loop guard
 // (at most MAX_AUTO_RESTARTS within RESTART_WINDOW_MS) keeps working across restarts.
 const RESTART_STATE_FILE = './feeder-restart-log.json';
