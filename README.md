@@ -1,5 +1,7 @@
 # @solncebro/market-data-feeder
 
+[![GitHub repo](https://img.shields.io/badge/github-solncebro%2Fmarket--data--feeder-blue?logo=github)](https://github.com/solncebro/market-data-feeder)
+
 On-demand market-data feeder. One exchange connection per process fans klines, moving averages and 24h volume out to multiple strategy apps over a local WebSocket channel — so each strategy stops opening its own ~1200-symbol kline subscriptions.
 
 Three consumption shapes live in this package:
