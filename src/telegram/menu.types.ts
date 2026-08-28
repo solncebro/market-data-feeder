@@ -1,4 +1,4 @@
-import type { KlineInterval } from '../domain/marketData.types.js';
+import type { KlineInterval } from '@solncebro/market-data-feeder-lib';
 
 enum MenuStep {
   Overview = 'overview',

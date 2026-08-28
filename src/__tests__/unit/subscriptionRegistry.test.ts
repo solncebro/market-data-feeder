@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { KlineInterval } from '../../domain/marketData.types.js';
-import type { ManagedSource } from '../../server/subscriptionRegistry.types.js';
+import type { KlineInterval } from '@solncebro/market-data-feeder-lib';
+import type { ManagedSource } from '@solncebro/market-data-feeder-lib';
 import { SubscriptionRegistry } from '../../server/subscriptionRegistry.js';
 
 interface FakeSource extends ManagedSource {

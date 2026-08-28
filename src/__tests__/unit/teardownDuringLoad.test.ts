@@ -3,10 +3,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RateLimitedRequestQueue } from '@solncebro/trade-engine';
 import type { ExchangeConnector, Kline } from '@solncebro/trade-engine';
 
-import type { KlineInterval } from '../../domain/marketData.types.js';
-import type { ManagedSource } from '../../server/subscriptionRegistry.types.js';
+import type { KlineInterval } from '@solncebro/market-data-feeder-lib';
+import type { ManagedSource } from '@solncebro/market-data-feeder-lib';
 import { SubscriptionRegistry } from '../../server/subscriptionRegistry.js';
-import { MarketDataManager } from '../../source/marketDataManager.js';
+import { MarketDataManager } from '@solncebro/market-data-feeder-lib';
 
 interface FakeSource extends ManagedSource {
   shutdown: ReturnType<typeof vi.fn>;

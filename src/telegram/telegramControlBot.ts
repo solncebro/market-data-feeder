@@ -13,7 +13,7 @@ import {
   registerBotCommands,
 } from '@solncebro/telegram-engine';
 
-import type { KlineInterval } from '../domain/marketData.types.js';
+import type { KlineInterval } from '@solncebro/market-data-feeder-lib';
 import { formatIntervalButtonLabel, formatIntervalDetailMessage, formatOverviewMessage, formatStaleSymbolMessage, formatSymbolCard } from './statusFormatter.js';
 import { MenuStep } from './menu.types.js';
 import type { CallbackData } from './menu.types.js';

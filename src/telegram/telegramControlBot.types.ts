@@ -1,4 +1,4 @@
-import type { KlineInterval, StaleSymbolInfo } from '../domain/marketData.types.js';
+import type { KlineInterval, StaleSymbolInfo } from '@solncebro/market-data-feeder-lib';
 import type { FeederLogger, FeederStatus, SymbolDiagnostics } from '../server/feederServer.types.js';
 
 interface FeederStatusProvider {

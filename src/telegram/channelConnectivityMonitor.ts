@@ -1,5 +1,5 @@
 import type { FeederLogger } from '../server/feederServer.types.js';
-import { withTimeout } from '../utils/timeout.js';
+import { withTimeout } from '@solncebro/market-data-feeder-lib';
 
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
 

@@ -1,8 +1,8 @@
-import type { KlineInterval, MaValues } from '../domain/marketData.types.js';
-import type { FeedEventName } from '../domain/subscription.types.js';
-import type { ServerMessage } from '../protocol/messages.types.js';
+import type { KlineInterval, MaValues } from '@solncebro/market-data-feeder-lib';
+import type { FeedEventName } from '@solncebro/market-data-feeder-lib';
+import type { ServerMessage } from '@solncebro/market-data-feeder-lib';
 import type { HealthEvent } from '../health/healthMonitor.types.js';
-import type { FeederSource, StreamLiveness } from './feederSource.types.js';
+import type { FeederSource, StreamLiveness } from '@solncebro/market-data-feeder-lib';
 
 interface FeederLogger {
   info: (payload: Record<string, unknown>, message: string) => void;

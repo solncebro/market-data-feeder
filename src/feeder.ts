@@ -1,11 +1,11 @@
 import { ExchangeConnector, RateLimitedRequestQueue, logger } from '@solncebro/trade-engine';
 import { escapeMarkdownV2WithFormatting } from '@solncebro/telegram-engine';
 
-import type { KlineInterval } from './domain/marketData.types.js';
-import { KLINE_WATCHDOG_GRACE_MS, KLINE_WATCHDOG_RECOVERY_COOLDOWN_MS, resolveBackfillRequestsPerSecond } from './domain/constants.js';
+import type { KlineInterval } from '@solncebro/market-data-feeder-lib';
+import { KLINE_WATCHDOG_GRACE_MS, KLINE_WATCHDOG_RECOVERY_COOLDOWN_MS, resolveBackfillRequestsPerSecond } from '@solncebro/market-data-feeder-lib';
 import type { FeederLogger } from './server/feederServer.types.js';
 import { loadEnvConfig } from './config/env.js';
-import { MarketDataManager } from './source/marketDataManager.js';
+import { MarketDataManager } from '@solncebro/market-data-feeder-lib';
 import { FeederServer } from './server/feederServer.js';
 import { createRestartGuard } from './health/restartGuard.js';
 import { createHealthMonitor } from './health/healthMonitor.js';

@@ -1,15 +1,15 @@
 import { WebSocket, WebSocketServer } from 'ws';
 
-import type { KlineInterval, StaleSymbolInfo } from '../domain/marketData.types.js';
-import type { FeedEventName, SubscriptionScope } from '../domain/subscription.types.js';
-import type { MarketDataSnapshotEntry } from '../domain/snapshot.types.js';
-import type { ServerMessage, SnapshotMessage, SubscribeMessage, SymbolAddedMessage, SymbolRemovedMessage, UnsubscribeMessage, Volume24hMessage } from '../protocol/messages.types.js';
-import { decodeMessage, encodeMessage } from '../protocol/codec.js';
-import { isValidSubscribe } from '../protocol/clientMessageValidation.js';
-import { SYMBOL_LIST_SYNC_INTERVAL_MS, isKnownInterval } from '../domain/constants.js';
+import type { KlineInterval, StaleSymbolInfo } from '@solncebro/market-data-feeder-lib';
+import type { FeedEventName, SubscriptionScope } from '@solncebro/market-data-feeder-lib';
+import type { MarketDataSnapshotEntry } from '@solncebro/market-data-feeder-lib';
+import type { ServerMessage, SnapshotMessage, SubscribeMessage, SymbolAddedMessage, SymbolRemovedMessage, UnsubscribeMessage, Volume24hMessage } from '@solncebro/market-data-feeder-lib';
+import { decodeMessage, encodeMessage } from '@solncebro/market-data-feeder-lib';
+import { isValidSubscribe } from '@solncebro/market-data-feeder-lib';
+import { SYMBOL_LIST_SYNC_INTERVAL_MS, isKnownInterval } from '@solncebro/market-data-feeder-lib';
 import { SubscriptionRegistry } from './subscriptionRegistry.js';
 import type { HealthEvent } from '../health/healthMonitor.types.js';
-import type { FeederSource } from './feederSource.types.js';
+import type { FeederSource } from '@solncebro/market-data-feeder-lib';
 import type { FeederLogger, FeederServerArgs, FeederStatus, ForwardFeedMessageArgs, IntervalStatus, SymbolDiagnostics } from './feederServer.types.js';
 
 const DEFAULT_SNAPSHOT_CHUNK_SIZE = 100;

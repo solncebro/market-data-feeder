@@ -1,5 +1,5 @@
-import type { KlineInterval } from '../domain/marketData.types.js';
-import type { ManagedSource, RegistrationStatus, SubscribeArgs, SubscriptionRegistryArgs, SymbolLoadOutcome } from './subscriptionRegistry.types.js';
+import type { KlineInterval, ManagedSource, SymbolLoadOutcome } from '@solncebro/market-data-feeder-lib';
+import type { RegistrationStatus, SubscribeArgs, SubscriptionRegistryArgs } from './subscriptionRegistry.types.js';
 
 const DEFAULT_TEARDOWN_DELAY_MS = 30_000;
 

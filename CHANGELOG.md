@@ -5,6 +5,16 @@
 Формат — по мотивам [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 нумерация версий — по [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0
+
+- **Split (2026-08-25): server only.** The library half — collection core (`MarketDataManager`),
+  `MarketDataClient`, embedded source, wire protocol, domain types and the source contracts
+  (`FeederSource`/`StreamLiveness`/`ManagedSource`/`SymbolLoadOutcome`) — moved to the published
+  package `@solncebro/market-data-feeder-lib` (sibling repo `../market-data-feeder-lib`); this
+  package is now `private: true` and consumes the library as a regular dependency. Deploy
+  commands unchanged. Tests split: 24 unit files moved to the library, this repo keeps 12 unit +
+  4 integration + `teardownDuringLoad` (wires the registry to the library's real manager).
+
 ## [0.2.0] - 2026-08-04
 
 ### Added

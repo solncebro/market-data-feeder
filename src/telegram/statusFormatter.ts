@@ -1,6 +1,6 @@
 import { formatClickableText } from '@solncebro/telegram-engine';
 
-import type { KlineInterval, MaValues, StaleSymbolInfo } from '../domain/marketData.types.js';
+import type { KlineInterval, MaValues, StaleSymbolInfo } from '@solncebro/market-data-feeder-lib';
 import type { FeederStatus, IntervalStatus, SymbolDiagnostics } from '../server/feederServer.types.js';
 
 type HealthIndicator = '🟢' | '🟡' | '🔴' | '⚪';

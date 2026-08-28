@@ -3,12 +3,12 @@ import { EventEmitter } from 'node:events';
 import { describe, expect, it } from 'vitest';
 import type { WebSocketLogger } from '@solncebro/websocket-engine';
 
-import type { Kline, KlineInterval, MaValues, StaleSymbolInfo } from '../../domain/marketData.types.js';
-import type { FeederSource } from '../../server/feederSource.types.js';
+import type { Kline, KlineInterval, MaValues, StaleSymbolInfo } from '@solncebro/market-data-feeder-lib';
+import type { FeederSource } from '@solncebro/market-data-feeder-lib';
 import type { FeederLogger } from '../../server/feederServer.types.js';
-import type { SymbolLoadOutcome } from '../../server/subscriptionRegistry.types.js';
+import type { SymbolLoadOutcome } from '@solncebro/market-data-feeder-lib';
 import { FeederServer } from '../../server/feederServer.js';
-import { MarketDataClient } from '../../client/marketDataClient.js';
+import { MarketDataClient } from '@solncebro/market-data-feeder-lib';
 
 const NOOP_FEEDER_LOGGER: FeederLogger = {
   info: () => undefined,

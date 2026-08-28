@@ -1,14 +1,9 @@
 {
   "name": "@solncebro/market-data-feeder",
-  "version": "0.2.0",
-  "description": "On-demand market-data feeder: one exchange connection, fans klines/MA/24h-volume out to multiple strategy apps over a local WebSocket channel",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "version": "0.3.0",
+  "description": "On-demand market-data feeder server: one exchange connection, fans klines/MA/24h-volume out to multiple strategy apps over a local WebSocket channel. Built on @solncebro/market-data-feeder-lib",
   "license": "MIT",
-  "private": false,
-  "publishConfig": {
-    "access": "public"
-  },
+  "private": true,
   "type": "module",
   "scripts": {
     "build": "yarn lint && yarn test && rm -rf dist && tsc",
@@ -19,14 +14,15 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "deploy:binance:leo": "yarn build && ssh root@209.38.110.21 'mkdir -p /opt/market-data-feeder-binance/' && rsync --archive --compress --delete --copy-unsafe-links .env.binance.leo dist package.json yarn.lock node_modules root@209.38.110.21:/opt/market-data-feeder-binance/ && ssh root@209.38.110.21 'cd /opt/market-data-feeder-binance && mv .env.binance.leo .env'",
-    "deploy:binance": "yarn build && ssh root@82.26.198.214 'mkdir -p /opt/market-data-feeder-binance/' && rsync --archive --compress --delete .env.binance dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-binance/ && ssh root@82.26.198.214 'cd /opt/market-data-feeder-binance && mv .env.binance .env'",
-    "deploy": "yarn build && ssh root@82.26.198.214 'mkdir -p /opt/market-data-feeder-bybit/' && rsync --archive --compress --delete .env.bybit dist package.json yarn.lock node_modules root@82.26.198.214:/opt/market-data-feeder-bybit/ && ssh root@82.26.198.214 'cd /opt/market-data-feeder-bybit && mv .env.bybit .env'",
+    "deploy:binance": "yarn build && ssh ubuntu@139.99.88.162 'mkdir -p /opt/market-data-feeder-binance/' && rsync --archive --compress --delete .env.binance dist package.json yarn.lock node_modules ubuntu@139.99.88.162:/opt/market-data-feeder-binance/ && ssh ubuntu@139.99.88.162 'cd /opt/market-data-feeder-binance && mv .env.binance .env'",
+    "deploy": "yarn build && ssh ubuntu@51.79.167.222 'mkdir -p /opt/market-data-feeder-bybit/' && rsync --archive --compress --delete .env.bybit dist package.json yarn.lock node_modules ubuntu@51.79.167.222:/opt/market-data-feeder-bybit/ && ssh ubuntu@51.79.167.222 'cd /opt/market-data-feeder-bybit && mv .env.bybit .env'",
     "deploy:all": "yarn deploy && yarn deploy:binance && yarn deploy:binance:leo"
   },
   "dependencies": {
-    "@solncebro/telegram-engine": "^0.4.0",
-    "@solncebro/trade-engine": "^3.14.0",
-    "@solncebro/websocket-engine": "^0.4.0",
+    "@solncebro/market-data-feeder-lib": "^0.1.0",
+    "@solncebro/telegram-engine": ">=0.4.0 <1.0.0",
+    "@solncebro/trade-engine": "^3.21.0",
+    "@solncebro/websocket-engine": ">=0.6.0 <1.0.0",
     "dotenv": "^16.4.5",
     "ws": "^8.18.0"
   },

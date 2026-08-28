@@ -9,3 +9,5 @@ feeder-restart-log.json
 *.log
 .DS_Store
 logs/
+# Файл блокировки библиотеке не нужен: версии определяет потребитель
+yarn.lock
